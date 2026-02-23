@@ -1,0 +1,31 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.env
+
+# Node
+node_modules/
+*.log
+npm-debug.log*
+
+# Electron build output
+jarvis-desktop/dist/
+jarvis-desktop/out/
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Secrets / keys
+.env.local
+.env.*.local
+*.key
+secrets.json

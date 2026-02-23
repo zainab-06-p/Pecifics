@@ -1,0 +1,177 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; connect-src *;">
+    <title>Pecifics</title>
+    <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+    <div class="app-container">
+        <!-- Title Bar -->
+        <div class="title-bar">
+            <div class="title-bar-left">
+                <span class="app-icon">🤖</span>
+                <span class="app-title">Pecifics</span>
+                <span class="status-indicator" id="statusIndicator">●</span>
+            </div>
+            <div class="title-bar-right">
+                <button class="title-btn" id="settingsBtn" title="Settings">⚙️</button>
+                <button class="title-btn" id="minimizeBtn" title="Minimize">─</button>
+                <button class="title-btn close-btn" id="closeBtn" title="Hide">✕</button>
+            </div>
+        </div>
+
+        <!-- Main Content -->
+        <div class="main-content" id="mainContent">
+            <!-- Chat View -->
+            <div class="view active" id="chatView">
+                <!-- Screenshot Preview -->
+                <div class="screenshot-preview" id="screenshotPreview">
+                    <div class="preview-header">
+                        <span>📷 Screen Capture</span>
+                        <div class="preview-controls">
+                            <label class="toggle-switch">
+                                <input type="checkbox" id="autoCaptureToggle" checked>
+                                <span class="slider"></span>
+                            </label>
+                            <span class="toggle-label">Auto</span>
+                        </div>
+                    </div>
+                    <div class="preview-image-container">
+                        <img id="screenshotImg" src="" alt="Screen capture">
+                        <div class="no-screenshot" id="noScreenshot">
+                            <span>📸</span>
+                            <p>No screenshot captured</p>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Chat Messages -->
+                <div class="chat-container" id="chatContainer">
+                    <div class="welcome-message" id="welcomeMessage">
+                        <div class="welcome-icon">🤖</div>
+                        <h2>Hello, I'm Pecifics</h2>
+                        <p>Your AI Desktop Assistant — I can do anything on your PC</p>
+                        <p class="welcome-hint">Try asking me to:</p>
+                        <ul class="welcome-examples">
+                            <li>🗂️ Create, move, rename, or delete files</li>
+                            <li>📝 Open Word / Excel / PowerPoint and edit them</li>
+                            <li>🌐 Open a website or search Google</li>
+                            <li>🔐 Log into Gmail and send an email</li>
+                            <li>🧹 Clear cache, temp files, flush DNS</li>
+                            <li>⚙️ Open Device Manager, Services, Task Manager</li>
+                            <li>🔄 Restart / shutdown / hibernate</li>
+                            <li>🔍 Kill a process or manage Windows services</li>
+                            <li>🌙 Enable dark mode or change power plan</li>
+                            <li>💾 Check disk health or run Windows Update</li>
+                            <li>🔔 Show a desktop notification</li>
+                            <li>📋 Read or write to clipboard</li>
+                        </ul>
+                    </div>
+                    <!-- Messages will be appended here -->
+                </div>
+
+                <!-- Action Status -->
+                <div class="action-status" id="actionStatus">
+                    <div class="action-progress">
+                        <div class="progress-bar" id="progressBar"></div>
+                    </div>
+                    <div class="action-status-row">
+                        <span class="action-text" id="actionText">Ready</span>
+                        <button class="stop-btn" id="stopBtn" style="display: none;" title="Stop Execution">
+                            <span>⏹</span>
+                        </button>
+                    </div>
+                </div>
+
+                <!-- Input Area -->
+                <div class="input-area">
+                    <!-- Preview Mode Toggle -->
+                    <div class="mode-toggle">
+                        <label class="preview-toggle">
+                            <input type="checkbox" id="previewModeToggle">
+                            <span class="toggle-slider"></span>
+                        </label>
+                        <span class="mode-label" id="modeLabel">🟢 Live Mode</span>
+                        <span class="mode-hint" id="modeHint">Actions will be executed</span>
+                    </div>
+                    
+                    <div class="input-container">
+                        <textarea 
+                            id="messageInput" 
+                            placeholder="Ask Pecifics to do something..."
+                            rows="1"
+                        ></textarea>
+                        <button class="send-btn" id="sendBtn" title="Send">
+                            <span>➤</span>
+                        </button>
+                    </div>
+                    <div class="input-hints">
+                        <span>Press <kbd>Enter</kbd> to send, <kbd>Shift+Enter</kbd> for new line</span>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Settings View -->
+            <div class="view" id="settingsView">
+                <div class="settings-container">
+                    <h2>⚙️ Settings</h2>
+                    
+                    <div class="settings-group">
+                        <h3>🔗 Connection</h3>
+                        <div class="setting-item">
+                            <label for="colabUrl">Colab Backend URL</label>
+                            <input type="text" id="colabUrl" placeholder="https://xxxx.ngrok.io">
+                            <p class="setting-hint">Enter the ngrok URL from your Colab notebook</p>
+                        </div>
+                        <button class="test-btn" id="testConnectionBtn">Test Connection</button>
+                        <div class="connection-status" id="connectionStatus"></div>
+                    </div>
+
+                    <div class="settings-group">
+                        <h3>📷 Screenshot Settings</h3>
+                        <div class="setting-item">
+                            <label for="screenshotInterval">Capture Interval (ms)</label>
+                            <input type="number" id="screenshotInterval" min="500" max="5000" step="100" value="1000">
+                            <p class="setting-hint">How often to capture screenshots (500-5000ms)</p>
+                        </div>
+                        <div class="setting-item">
+                            <label for="screenshotQuality">Image Quality</label>
+                            <input type="range" id="screenshotQuality" min="30" max="100" value="80">
+                            <span class="range-value" id="qualityValue">80%</span>
+                        </div>
+                    </div>
+
+                    <div class="settings-group">
+                        <h3>⌨️ Hotkey</h3>
+                        <div class="setting-item">
+                            <label for="hotkey">Toggle Window Hotkey</label>
+                            <input type="text" id="hotkey" placeholder="CommandOrControl+Shift+J" readonly>
+                            <p class="setting-hint">Click and press your desired key combination</p>
+                        </div>
+                    </div>
+
+                    <div class="settings-group">
+                        <h3>🎨 Appearance</h3>
+                        <div class="setting-item checkbox-item">
+                            <label>
+                                <input type="checkbox" id="alwaysOnTop" checked>
+                                Always on top
+                            </label>
+                        </div>
+                    </div>
+
+                    <div class="settings-actions">
+                        <button class="btn-secondary" id="backBtn">← Back</button>
+                        <button class="btn-primary" id="saveSettingsBtn">Save Settings</button>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script src="renderer.js"></script>
+</body>
+</html>
