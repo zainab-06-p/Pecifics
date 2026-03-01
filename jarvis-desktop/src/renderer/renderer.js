@@ -1,1309 +1,951 @@
-// ============================================
-// Pecifics Desktop Assistant - Renderer Script
-// ============================================
+// =============================================================
+// Pecifics AI — Renderer (Multi-Task, Vision, User Input)
+// =============================================================
 
-class PecificsApp {
-    constructor() {
-        // State
-        this.settings = {};
-        this.conversationHistory = [];
-        this.isProcessing = false;
-        this.latestScreenshot = null;
-        this.previewMode = true; // START IN PREVIEW MODE FOR SAFETY!
-        this.pendingActions = null; // Store actions waiting for confirmation
-        
-        // Feedback loop state
-        this.feedbackLoopEnabled = true;
-        this.currentTask = '';
-        this.expectedResult = '';
-        this.maxRetries = 3;
-        this.currentRetry = 0;
-        
-        // Interactive choice state
-        this.waitingForChoice = false;
-        this.choiceType = null;
-        this.choiceOptions = [];
-        this.pendingTask = null;
-        
-        // DOM Elements
-        this.elements = {
-            // Views
-            chatView: document.getElementById('chatView'),
-            settingsView: document.getElementById('settingsView'),
-            
-            // Chat
-            chatContainer: document.getElementById('chatContainer'),
-            messageInput: document.getElementById('messageInput'),
-            sendBtn: document.getElementById('sendBtn'),
-            welcomeMessage: document.getElementById('welcomeMessage'),
-            
-            // Screenshot
-            screenshotImg: document.getElementById('screenshotImg'),
-            noScreenshot: document.getElementById('noScreenshot'),
-            autoCaptureToggle: document.getElementById('autoCaptureToggle'),
-            
-            // Status
-            statusIndicator: document.getElementById('statusIndicator'),
-            actionStatus: document.getElementById('actionStatus'),
-            progressBar: document.getElementById('progressBar'),
-            actionText: document.getElementById('actionText'),
-            stopBtn: document.getElementById('stopBtn'),
-            
-            // Window controls
-            settingsBtn: document.getElementById('settingsBtn'),
-            minimizeBtn: document.getElementById('minimizeBtn'),
-            closeBtn: document.getElementById('closeBtn'),
-            
-            // Settings
-            colabUrl: document.getElementById('colabUrl'),
-            screenshotInterval: document.getElementById('screenshotInterval'),
-            screenshotQuality: document.getElementById('screenshotQuality'),
-            qualityValue: document.getElementById('qualityValue'),
-            hotkey: document.getElementById('hotkey'),
-            alwaysOnTop: document.getElementById('alwaysOnTop'),
-            testConnectionBtn: document.getElementById('testConnectionBtn'),
-            connectionStatus: document.getElementById('connectionStatus'),
-            backBtn: document.getElementById('backBtn'),
-            saveSettingsBtn: document.getElementById('saveSettingsBtn'),
-            
-            // Preview Mode
-            previewModeToggle: document.getElementById('previewModeToggle'),
-            modeLabel: document.getElementById('modeLabel'),
-            modeHint: document.getElementById('modeHint')
-        };
-        
-        this.init();
-    }
-    
-    async init() {
-        // Load settings
-        await this.loadSettings();
-        
-        // Setup event listeners
-        this.setupEventListeners();        
-        // Setup stop button
-        this.setupStopButton();        
-        // Setup screenshot listener
-        this.setupScreenshotListener();
-        
-        // Check connection status
-        this.checkConnection();
-        
-        // Initialize preview mode (ON by default for safety)
-        this.setPreviewMode(true);
-        
-        console.log('Pecifics initialized in PREVIEW MODE (safe mode)');
-    }
-    
-    async loadSettings() {
-        this.settings = await window.electronAPI.getSettings();
-        this.applySettingsToUI();
-    }
-    
-    applySettingsToUI() {
-        this.elements.colabUrl.value = this.settings.colabUrl || '';
-        this.elements.screenshotInterval.value = this.settings.screenshotInterval || 1000;
-        this.elements.screenshotQuality.value = this.settings.screenshotQuality || 80;
-        this.elements.qualityValue.textContent = `${this.settings.screenshotQuality || 80}%`;
-        this.elements.hotkey.value = this.settings.hotkey || 'CommandOrControl+Shift+J';
-        this.elements.autoCaptureToggle.checked = this.settings.autoScreenshot !== false;
-    }
-    
-    setupEventListeners() {
-        // Send message
-        this.elements.sendBtn.addEventListener('click', () => this.sendMessage());
-        this.elements.messageInput.addEventListener('keydown', (e) => {
-            if (e.key === 'Enter' && !e.shiftKey) {
-                e.preventDefault();
-                this.sendMessage();
-            }
-        });
-        
-        // Auto-resize textarea
-        this.elements.messageInput.addEventListener('input', () => {
-            this.elements.messageInput.style.height = 'auto';
-            this.elements.messageInput.style.height = Math.min(this.elements.messageInput.scrollHeight, 100) + 'px';
-        });
-        
-        // Window controls
-        this.elements.minimizeBtn.addEventListener('click', () => window.electronAPI.minimizeWindow());
-        this.elements.closeBtn.addEventListener('click', () => window.electronAPI.closeWindow());
-        
-        // Settings
-        this.elements.settingsBtn.addEventListener('click', () => this.showSettings());
-        this.elements.backBtn.addEventListener('click', () => this.hideSettings());
-        this.elements.saveSettingsBtn.addEventListener('click', () => this.saveSettings());
-        this.elements.testConnectionBtn.addEventListener('click', () => this.testConnection());
-        
-        // Screenshot toggle
-        this.elements.autoCaptureToggle.addEventListener('change', (e) => {
-            if (e.target.checked) {
-                window.electronAPI.startCapture();
-            } else {
-                window.electronAPI.stopCapture();
-            }
-        });
-        
-        // Quality slider
-        this.elements.screenshotQuality.addEventListener('input', (e) => {
-            this.elements.qualityValue.textContent = `${e.target.value}%`;
-        });
-        
-        // Always on top
-        this.elements.alwaysOnTop.addEventListener('change', (e) => {
-            window.electronAPI.toggleAlwaysOnTop(e.target.checked);
-        });
-        
-        // Preview mode toggle
-        this.elements.previewModeToggle.addEventListener('change', (e) => {
-            this.setPreviewMode(e.target.checked);
-        });
-        
-        // Show settings from tray
-        window.electronAPI.onShowSettings(() => this.showSettings());
-    }
-    
-    setupStopButton() {
-        this.elements.stopBtn.addEventListener('click', async () => {
-            await this.stopExecution();
-        });
-    }
-    
-    showStopButton() {
-        this.elements.stopBtn.style.display = 'flex';
-    }
-    
-    hideStopButton() {
-        this.elements.stopBtn.style.display = 'none';
-    }
-    
-    async stopExecution() {
+(function () {
+    'use strict';
+
+    // ─── DOM ────────────────────────────────────────────────────
+    const $ = (s) => document.querySelector(s);
+    const $$ = (s) => document.querySelectorAll(s);
+
+    const chatContainer   = $('#chatContainer');
+    const messageInput    = $('#messageInput');
+    const sendBtn         = $('#sendBtn');
+    const stopBtn         = $('#stopBtn');
+    const progressArea    = $('#progressArea');
+    const progressFill    = $('#progressFill');
+    const progressText    = $('#progressText');
+    const statusDot       = $('#statusDot');
+    const previewToggle   = $('#previewToggle');
+    const modeLabel       = $('#modeLabel');
+    const welcomeMessage  = $('#welcomeMessage');
+    const offlineBanner   = $('#offlineBanner');
+    const retryBtn        = $('#retryBtn');
+
+    // Settings
+    const settingsBtn     = $('#settingsBtn');
+    const backBtn         = $('#backBtn');
+    const chatView        = $('#chatView');
+    const settingsView    = $('#settingsView');
+    const colabUrl        = $('#colabUrl');
+    const cogagentUrl     = $('#cogagentUrl');
+    const testConnectionBtn = $('#testConnectionBtn');
+    const connectionStatus  = $('#connectionStatus');
+    const saveSettingsBtn   = $('#saveSettingsBtn');
+    const minimizeBtn     = $('#minimizeBtn');
+    const closeBtn        = $('#closeBtn');
+    const qualityRange    = $('#screenshotQuality');
+    const qualityValue    = $('#qualityValue');
+
+    // ─── STATE ──────────────────────────────────────────────────
+    let backendUrl = 'http://localhost:8000';
+    let conversationHistory = [];
+    let isProcessing = false;
+    let shouldStop = false;
+    let previewMode = false;
+    let screenWidth = 1920;
+    let screenHeight = 1080;
+    let userHome = '';
+
+    // ─── INIT ───────────────────────────────────────────────────
+    async function init() {
         try {
-            await window.electronAPI.stopExecution();
-            this.addMessage('⏹ Stopping execution...', 'system');
-        } catch (error) {
-            console.error('Failed to stop execution:', error);
-        }
-    }
-    
-    setupScreenshotListener() {
-        window.electronAPI.onScreenshotCaptured((data) => {
-            if (data && data.screenshot) {
-                this.latestScreenshot = data;
-                this.elements.screenshotImg.src = `data:image/jpeg;base64,${data.screenshot}`;
-                this.elements.screenshotImg.classList.add('visible');
-                this.elements.noScreenshot.classList.add('hidden');
+            const settings = await window.electronAPI.getSettings();
+            if (settings.colabUrl) backendUrl = settings.colabUrl;
+            if (settings.colabUrl) colabUrl.value = settings.colabUrl;
+            if (settings.cogagentUrl) cogagentUrl.value = settings.cogagentUrl;
+            if (settings.alwaysOnTop !== undefined) {
+                $('#alwaysOnTop').checked = settings.alwaysOnTop;
             }
-        });
-    }
-    
-    // ============================================
-    // Chat Functions
-    // ============================================
-    
-    async sendMessage() {
-        const message = this.elements.messageInput.value.trim();
-        if (!message || this.isProcessing) return;
-        
-        // Check if connected
-        if (!this.settings.colabUrl) {
-            this.addMessage('Please configure the Colab backend URL in settings first.', 'system');
-            this.showSettings();
-            return;
-        }
-        
-        // Hide welcome message
-        this.elements.welcomeMessage.classList.add('hidden');
-        
-        // Clear input
-        this.elements.messageInput.value = '';
-        this.elements.messageInput.style.height = 'auto';
-        
-        // Add user message
-        this.addMessage(message, 'user');
-        this.conversationHistory.push({ role: 'user', content: message });
-        
-        // Show typing indicator
-        this.isProcessing = true;
-        this.showTypingIndicator();
-        this.showActionStatus('Processing your request...');
-        
-        try {
-            // Get fresh screenshot if auto-capture is on
-            let screenshot = null;
-            if (this.elements.autoCaptureToggle.checked) {
-                const screenshotData = await window.electronAPI.takeScreenshot();
-                if (screenshotData) {
-                    screenshot = screenshotData.screenshot;
-                    this.latestScreenshot = screenshotData;
-                }
-            } else if (this.latestScreenshot) {
-                screenshot = this.latestScreenshot.screenshot;
-            }
-            
-            // Get screen info
-            const screenInfo = await window.electronAPI.getScreenInfo();
-            
-            // Send to backend
-            const response = await this.callBackend('/chat', {
-                message: message,
-                screenshot: screenshot,
-                conversation_history: this.conversationHistory.slice(-10),
-                screen_width: screenInfo.width,
-                screen_height: screenInfo.height
-            });
-            
-            // Hide typing indicator
-            this.hideTypingIndicator();
-            
-            if (response.error) {
-                this.addMessage(`Error: ${response.error}`, 'error');
-            } else {
-                // CHECK FOR CLARIFICATION NEEDED
-                if (response.clarification_needed) {
-                    await this.handleClarificationRequest(response);
-                    return;
-                }
 
-                // CHECK FOR INTERACTIVE CHOICE
-                if (response.requires_choice) {
-                    // AI needs user to make a choice
-                    await this.handleChoiceRequest(response);
-                    return; // Wait for user to choose
-                }
-                
-                // Add assistant response
-                if (response.message) {
-                    // Show task count if multiple tasks detected
-                    const taskInfo = response.task_count > 1 
-                        ? ` (${response.task_count} tasks detected)` 
-                        : '';
-                    this.addMessage(response.message + taskInfo, 'assistant');
-                }
-                
-                // Store task info for feedback loop
-                this.currentTask = message;
-                this.expectedResult = response.expected_result || '';
-                this.currentRetry = 0;
-                
-                // Store task summary for display after execution
-                this.currentTaskSummary = response.task_summary || null;
+            // Push saved CogAgent URL to backend on startup so it persists in memory
+            if (settings.cogagentUrl) {
+                try {
+                    await fetch(`${backendUrl}/set_config`, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ cogagent_url: settings.cogagentUrl }),
+                    });
+                    console.log('[init] Pushed CogAgent URL to backend:', settings.cogagentUrl);
+                } catch (e) { console.warn('[init] Could not push CogAgent URL to backend:', e); }
 
-                // Handle actions based on mode
-                if (response.actions && response.actions.length > 0) {
-                    if (this.previewMode) {
-                        // PREVIEW MODE: Show actions without executing
-                        this.showPreviewActions(response.actions, response.task_count);
+                // Also verify direct CogAgent connectivity
+                try {
+                    const cogHealth = await window.electronAPI.cogagentHealth();
+                    if (cogHealth.ok) {
+                        console.log('[init] CogAgent DIRECT connection OK:', cogHealth.data);
                     } else {
-                        // LIVE MODE: Execute actions
-                        await this.executeActions(response.actions);
+                        console.warn('[init] CogAgent not reachable directly:', cogHealth.error);
                     }
-                }
-                
-                this.conversationHistory.push({ 
-                    role: 'assistant', 
-                    content: response.message || 'Actions executed.'
-                });
+                } catch (e) { console.warn('[init] CogAgent health check failed:', e); }
             }
-            
-        } catch (error) {
-            this.hideTypingIndicator();
-            this.addMessage(`Connection error: ${error.message}`, 'error');
-        } finally {
-            this.isProcessing = false;
-            this.hideActionStatus();
-        }
-    }
-    
-    renderMarkdown(text) {
-        if (!text) return '';
-        // Bold **text**
-        text = text.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
-        // Italic *text*
-        text = text.replace(/\*(.+?)\*/g, '<em>$1</em>');
-        // Inline code `code`
-        text = text.replace(/`([^`]+)`/g, '<code>$1</code>');
-        // Newlines
-        text = text.replace(/\n/g, '<br>');
-        // Numbered list items: 1. item
-        text = text.replace(/^(\d+\.\s)/gm, '<span style="opacity:0.7">$1</span>');
-        // Bullet list items
-        text = text.replace(/^[-•]\s/gm, '• ');
-        return text;
+        } catch (e) {}
+
+        try {
+            const info = await window.electronAPI.getScreenInfo();
+            if (info) { screenWidth = info.width; screenHeight = info.height; }
+        } catch (e) {}
+
+        try { userHome = await window.electronAPI.getUserHome(); } catch (e) {}
+
+        checkBackendConnection();
+        setInterval(checkBackendConnection, 30000);
     }
 
-    addMessage(content, type, actions = null) {
-        const messageDiv = document.createElement('div');
-        messageDiv.className = `message ${type}`;
-        if (type === 'assistant' || type === 'system') {
-            messageDiv.innerHTML = this.renderMarkdown(content);
-        } else {
-            messageDiv.textContent = content;
+    // ─── BACKEND CONNECTION ─────────────────────────────────────
+    async function checkBackendConnection() {
+        let langchainOk = false;
+        try {
+            const resp = await fetch(`${backendUrl}/health`, { signal: AbortSignal.timeout(5000) });
+            if (resp.ok) langchainOk = true;
+        } catch (e) {}
+
+        // Also check CogAgent direct reachability
+        let cogOk = false;
+        const currentCogUrl = cogagentUrl.value.trim();
+        if (currentCogUrl) {
+            try {
+                const cogHealth = await window.electronAPI.cogagentHealth();
+                cogOk = cogHealth.ok;
+            } catch (e) {}
         }
-        
-        // Add action cards if present
-        if (actions && actions.length > 0) {
-            actions.forEach(action => {
-                const actionCard = document.createElement('div');
-                actionCard.className = 'action-card';
-                actionCard.innerHTML = `
-                    <div class="action-name">🔧 ${action.name || action.function?.name || 'Action'}</div>
-                    <div class="action-params">${JSON.stringify(action.parameters || action.arguments || {}, null, 2)}</div>
-                `;
-                messageDiv.appendChild(actionCard);
+
+        // Update status indicator
+        if (langchainOk || cogOk) {
+            statusDot.classList.add('connected');
+            const parts = [];
+            if (langchainOk) parts.push('LLM Backend');
+            if (cogOk) parts.push('CogAgent');
+            statusDot.title = `Connected: ${parts.join(' + ')}`;
+            offlineBanner.classList.remove('visible');
+            return true;
+        }
+
+        statusDot.classList.remove('connected');
+        statusDot.title = 'Disconnected — start backend and/or set CogAgent URL';
+        offlineBanner.classList.add('visible');
+        return false;
+    }
+
+    retryBtn.addEventListener('click', () => checkBackendConnection());
+
+    // ─── MESSAGES ───────────────────────────────────────────────
+    function addMessage(text, role = 'ai') {
+        if (welcomeMessage) welcomeMessage.style.display = 'none';
+
+        const msg = document.createElement('div');
+        msg.className = `msg ${role}`;
+
+        if (role === 'ai') {
+            msg.innerHTML = `
+                <div class="msg-avatar">P</div>
+                <div class="msg-bubble">
+                    <div class="msg-text">${escapeHtml(text)}</div>
+                    <div class="msg-actions">
+                        <button class="msg-action-btn copy-btn" title="Copy">
+                            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg>
+                            Copy
+                        </button>
+                    </div>
+                </div>`;
+        } else {
+            msg.innerHTML = `
+                <div class="msg-bubble">
+                    <div class="msg-text">${escapeHtml(text)}</div>
+                    <div class="msg-actions">
+                        <button class="msg-action-btn copy-btn" title="Copy">
+                            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg>
+                            Copy
+                        </button>
+                        <button class="msg-action-btn edit-btn" title="Edit & resend">
+                            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M11 4H4a2 2 0 00-2 2v14a2 2 0 002 2h14a2 2 0 002-2v-7"/><path d="M18.5 2.5a2.12 2.12 0 013 3L12 15l-4 1 1-4 9.5-9.5z"/></svg>
+                            Edit
+                        </button>
+                    </div>
+                </div>`;
+        }
+
+        chatContainer.appendChild(msg);
+        scrollToBottom();
+
+        // Wire copy/edit buttons
+        const copyBtn = msg.querySelector('.copy-btn');
+        if (copyBtn) {
+            copyBtn.addEventListener('click', () => {
+                navigator.clipboard.writeText(text);
+                copyBtn.classList.add('copied');
+                copyBtn.innerHTML = `<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="20 6 9 17 4 12"/></svg> Copied`;
+                setTimeout(() => {
+                    copyBtn.classList.remove('copied');
+                    copyBtn.innerHTML = `<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg> Copy`;
+                }, 2000);
             });
         }
-        
-        this.elements.chatContainer.appendChild(messageDiv);
-        this.scrollToBottom();
-    }
-    
-    showTypingIndicator() {
-        const indicator = document.createElement('div');
-        indicator.className = 'typing-indicator';
-        indicator.id = 'typingIndicator';
-        indicator.innerHTML = '<span></span><span></span><span></span>';
-        this.elements.chatContainer.appendChild(indicator);
-        this.scrollToBottom();
-    }
-    
-    hideTypingIndicator() {
-        const indicator = document.getElementById('typingIndicator');
-        if (indicator) indicator.remove();
-    }
-    
-    showActionStatus(text) {
-        this.elements.actionStatus.classList.add('active');
-        this.elements.progressBar.classList.add('indeterminate');
-        this.elements.actionText.textContent = text;
-    }
-    
-    hideActionStatus() {
-        this.elements.actionStatus.classList.remove('active');
-        this.elements.progressBar.classList.remove('indeterminate');
-    }
-    
-    scrollToBottom() {
-        this.elements.chatContainer.scrollTop = this.elements.chatContainer.scrollHeight;
-    }
-    
-    // ============================================
-    // Preview Mode Functions
-    // ============================================
-    
-    setPreviewMode(enabled) {
-        this.previewMode = enabled;
-        this.elements.previewModeToggle.checked = enabled;
-        
-        if (enabled) {
-            this.elements.modeLabel.textContent = '👁️ Preview Mode';
-            this.elements.modeLabel.classList.add('preview');
-            this.elements.modeHint.textContent = 'Actions shown but NOT executed';
-        } else {
-            this.elements.modeLabel.textContent = '🟢 Live Mode';
-            this.elements.modeLabel.classList.remove('preview');
-            this.elements.modeHint.textContent = 'Actions WILL be executed';
+
+        const editBtn = msg.querySelector('.edit-btn');
+        if (editBtn) {
+            editBtn.addEventListener('click', () => startEdit(msg, text));
         }
+
+        return msg;
     }
-    
-    showPreviewActions(actions, taskCount = 1) {
-        // Store pending actions
-        this.pendingActions = actions;
-        
-        // Create preview container
-        const previewDiv = document.createElement('div');
-        previewDiv.className = 'preview-actions-container';
-        previewDiv.id = 'previewActionsContainer';
-        
-        const taskInfo = taskCount > 1 ? ` (${taskCount} tasks)` : '';
-        
-        let html = `
-            <div class="preview-banner">👁️ PREVIEW MODE - Actions will NOT be executed</div>
-            <div class="preview-actions-header">Pecifics wants to perform ${actions.length} action(s)${taskInfo}:</div>
-        `;
-        
-        actions.forEach((action, index) => {
-            const actionName = action.name || action.function?.name || 'Unknown';
-            const params = action.parameters || action.arguments || {};
-            
-            // Check if action would be safe
-            const safetyIcon = this.getSafetyIcon(actionName, params);
-            
-            html += `
-                <div class="preview-action-item">
-                    <span class="preview-action-number">${index + 1}.</span>
-                    <span class="preview-action-name">${safetyIcon} ${actionName}</span>
-                    <div class="preview-action-params">${JSON.stringify(params, null, 2)}</div>
+
+    function addThinking() {
+        if (welcomeMessage) welcomeMessage.style.display = 'none';
+        const msg = document.createElement('div');
+        msg.className = 'msg ai';
+        msg.id = 'thinkingMsg';
+        msg.innerHTML = `
+            <div class="msg-avatar">P</div>
+            <div class="msg-bubble">
+                <div class="thinking">
+                    <div class="thinking-dot"></div>
+                    <div class="thinking-dot"></div>
+                    <div class="thinking-dot"></div>
                 </div>
-            `;
-        });
-        
-        html += `
-            <button class="execute-preview-btn" id="executePreviewBtn">
-                ✅ Approve & Execute These Actions
-            </button>
-            <button class="cancel-preview-btn" id="cancelPreviewBtn">
-                ❌ Cancel - Don't Execute
-            </button>
-        `;
-        
-        previewDiv.innerHTML = html;
-        this.elements.chatContainer.appendChild(previewDiv);
-        this.scrollToBottom();
-        
-        // Add event listeners
-        document.getElementById('executePreviewBtn').addEventListener('click', () => {
-            this.executePreviewedActions();
-        });
-        
-        document.getElementById('cancelPreviewBtn').addEventListener('click', () => {
-            this.cancelPreviewedActions();
-        });
-    }
-    
-    getSafetyIcon(actionName, params) {
-        // Visual indicator of action safety
-        const dangerousActions = ['delete_file', 'delete_folder', 'run_command'];
-        const cautionActions = ['move_file', 'rename_file', 'click_at', 'type_text'];
-        
-        if (dangerousActions.includes(actionName)) {
-            return '🔴';
-        } else if (cautionActions.includes(actionName)) {
-            return '🟡';
-        } else {
-            return '🟢';
-        }
-    }
-    
-    async executePreviewedActions() {
-        if (!this.pendingActions) return;
-        
-        // Remove preview container
-        const previewContainer = document.getElementById('previewActionsContainer');
-        if (previewContainer) {
-            previewContainer.remove();
-        }
-        
-        // Add confirmation message
-        this.addMessage('✅ Actions approved! Executing...', 'system');
-        
-        // Execute the actions
-        await this.executeActions(this.pendingActions);
-        
-        // Clear pending actions
-        this.pendingActions = null;
-    }
-    
-    cancelPreviewedActions() {
-        // Remove preview container
-        const previewContainer = document.getElementById('previewActionsContainer');
-        if (previewContainer) {
-            previewContainer.remove();
-        }
-        
-        // Add cancellation message
-        this.addMessage('❌ Actions cancelled. Nothing was executed.', 'system');
-        
-        // Clear pending actions
-        this.pendingActions = null;
+            </div>`;
+        chatContainer.appendChild(msg);
+        scrollToBottom();
+        return msg;
     }
 
-    // ============================================
-    // Clarification System
-    // ============================================
-
-    async handleClarificationRequest(response) {
-        this.hideTypingIndicator();
-        // Show the AI's question message
-        if (response.message) {
-            this.addMessage(response.message, 'assistant');
-        }
-        // Store the pending response context
-        this.pendingClarificationResponse = response;
-        // Show the input form
-        this.showClarificationForm(
-            response.clarification_question || 'Please provide the following details:',
-            response.clarification_fields || []
-        );
+    function removeThinking() {
+        const t = $('#thinkingMsg');
+        if (t) t.remove();
     }
 
-    showClarificationForm(question, fields) {
-        const formDiv = document.createElement('div');
-        formDiv.className = 'clarification-form';
-        formDiv.id = 'clarificationForm';
-
-        let fieldsHtml = '';
-        fields.forEach(f => {
-            fieldsHtml += `
-                <div class="clarification-field">
-                    <label>${f.label || f.key}</label>
-                    <input type="text"
-                           id="clarify_${f.key}"
-                           placeholder="${f.placeholder || ''}"
-                           value="${f.default || ''}" />
-                </div>`;
-        });
-
-        formDiv.innerHTML = `
-            <div class="clarification-question">${question}</div>
-            <div class="clarification-fields">${fieldsHtml}</div>
-            <div class="clarification-actions">
-                <button id="clarifySubmitBtn" class="clarification-submit-btn">Submit ↵</button>
-                <button id="clarifyCancelBtn" class="clarification-cancel-btn">Cancel</button>
+    // ─── EDIT USER MESSAGE ──────────────────────────────────────
+    function startEdit(msgEl, originalText) {
+        const bubble = msgEl.querySelector('.msg-bubble');
+        bubble.classList.add('editing');
+        bubble.innerHTML = `
+            <textarea class="edit-textarea" rows="3">${escapeHtml(originalText)}</textarea>
+            <div class="edit-actions">
+                <button class="edit-save">Resend</button>
+                <button class="edit-cancel">Cancel</button>
             </div>`;
 
-        this.elements.chatContainer.appendChild(formDiv);
-        this.scrollToBottom();
+        const textarea = bubble.querySelector('.edit-textarea');
+        textarea.focus();
+        textarea.setSelectionRange(textarea.value.length, textarea.value.length);
 
-        // Focus first input
-        const firstInput = formDiv.querySelector('input');
-        if (firstInput) setTimeout(() => firstInput.focus(), 100);
-
-        const fields_ = fields;
-        document.getElementById('clarifySubmitBtn').addEventListener('click', () => {
-            this.submitClarificationForm(fields_);
-        });
-        document.getElementById('clarifyCancelBtn').addEventListener('click', () => {
-            formDiv.remove();
-            this.addMessage('❌ Clarification cancelled.', 'system');
-            this.pendingClarificationResponse = null;
-        });
-        // Allow Enter key on last input
-        formDiv.addEventListener('keydown', (e) => {
-            if (e.key === 'Enter') this.submitClarificationForm(fields_);
-        });
-    }
-
-    async submitClarificationForm(fields) {
-        const formDiv = document.getElementById('clarificationForm');
-
-        // Collect values
-        const answers = {};
-        fields.forEach(f => {
-            const input = document.getElementById(`clarify_${f.key}`);
-            answers[f.key] = input ? input.value.trim() || f.default || '' : f.default || '';
+        bubble.querySelector('.edit-save').addEventListener('click', () => {
+            const newText = textarea.value.trim();
+            if (newText) {
+                // Remove all messages after this one
+                let next = msgEl.nextElementSibling;
+                while (next) {
+                    const toRemove = next;
+                    next = next.nextElementSibling;
+                    toRemove.remove();
+                }
+                // Trim conversation history
+                const idx = conversationHistory.findLastIndex(h => h.role === 'user' && h.content === originalText);
+                if (idx !== -1) conversationHistory.splice(idx);
+                msgEl.remove();
+                sendMessage(newText);
+            }
         });
 
-        // Remove the form
-        if (formDiv) formDiv.remove();
-
-        // ── Special: 2FA / OTP code ── type directly into the browser page ──
-        if (answers.otp_code) {
-            this.addMessage(`🔐 Entering 2FA code into browser...`, 'system');
-            await window.electronAPI.executeAction({
-                action: 'browser_search_in_page', params: { text: answers.otp_code }
+        bubble.querySelector('.edit-cancel').addEventListener('click', () => {
+            bubble.classList.remove('editing');
+            bubble.innerHTML = `
+                <div class="msg-text">${escapeHtml(originalText)}</div>
+                <div class="msg-actions">
+                    <button class="msg-action-btn copy-btn" title="Copy">
+                        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg>
+                        Copy
+                    </button>
+                    <button class="msg-action-btn edit-btn" title="Edit & resend">
+                        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M11 4H4a2 2 0 00-2 2v14a2 2 0 002 2h14a2 2 0 002-2v-7"/><path d="M18.5 2.5a2.12 2.12 0 013 3L12 15l-4 1 1-4 9.5-9.5z"/></svg>
+                        Edit
+                    </button>
+                </div>`;
+            bubble.querySelector('.copy-btn').addEventListener('click', () => {
+                navigator.clipboard.writeText(originalText);
             });
-            await this.delay(2000);
-            await this.watchBrowserAfterAction();
-            return;
-        }
-
-        // Build a natural-language answer message
-        const answerParts = fields.map(f => `${f.label || f.key}: ${answers[f.key]}`).join(', ');
-        this.addMessage(answerParts, 'user');
-        this.conversationHistory.push({ role: 'user', content: answerParts });
-
-        // Re-send to backend with clarification answers appended to original message
-        this.isProcessing = true;
-        this.showTypingIndicator();
-        this.showActionStatus('Processing with your details...');
-
-        try {
-            const screenInfo = await window.electronAPI.getScreenInfo();
-            const response = await this.callBackend('/chat', {
-                message: answerParts,
-                conversation_history: this.conversationHistory.slice(-12),
-                screen_width: screenInfo.width,
-                screen_height: screenInfo.height
-            });
-
-            this.hideTypingIndicator();
-
-            if (response.error) {
-                this.addMessage(`Error: ${response.error}`, 'error');
-            } else {
-                if (response.message) this.addMessage(response.message, 'assistant');
-                this.currentTaskSummary = response.task_summary || null;
-                if (response.actions && response.actions.length > 0) {
-                    if (this.previewMode) {
-                        this.showPreviewActions(response.actions, response.task_count);
-                    } else {
-                        await this.executeActions(response.actions);
-                    }
-                }
-                this.conversationHistory.push({ role: 'assistant', content: response.message || 'Done.' });
-            }
-        } catch (error) {
-            this.hideTypingIndicator();
-            this.addMessage(`Connection error: ${error.message}`, 'error');
-        } finally {
-            this.isProcessing = false;
-            this.hideActionStatus();
-            this.pendingClarificationResponse = null;
-        }
-    }
-
-    showTaskSummary(summary, results) {
-        const card = document.createElement('div');
-        card.className = 'task-summary-card';
-
-        const successCount = results.filter(r => r.result && r.result.success !== false).length;
-        const failCount = results.length - successCount;
-        const statusIcon = failCount === 0 ? '✅' : '⚠️';
-
-        // Format summary lines
-        const summaryHtml = summary
-            .split('\n')
-            .filter(l => l.trim())
-            .map(line => `<div class="summary-line">${this.renderMarkdown(line)}</div>`)
-            .join('');
-
-        card.innerHTML = `
-            <div class="task-summary-header">${statusIcon} Task Summary</div>
-            <div class="task-summary-body">${summaryHtml}</div>
-            <div class="task-summary-stats">${successCount} completed · ${failCount} failed</div>`;
-
-        this.elements.chatContainer.appendChild(card);
-        this.scrollToBottom();
-    }
-
-    // ============================================
-    // Browser Screen Watch (post-action blocker detection)
-    // ============================================
-
-    /**
-     * After a browser action, take a page screenshot via Playwright,
-     * send to /check_browser_state, and auto-handle or inform user.
-     * Loops up to maxPasses times to chain-handle multiple blockers.
-     */
-    async watchBrowserAfterAction(maxPasses = 4) {
-        for (let pass = 0; pass < maxPasses; pass++) {
-            // 1. Take browser page screenshot (base64) via main process
-            let b64 = null;
-            try {
-                const r = await window.electronAPI.executeAction({
-                    action: 'browser_page_screenshot_b64', params: {}
-                });
-                b64 = r && r.success ? r.data : null;
-            } catch { break; }
-
-            if (!b64) break;
-
-            // 2. Ask vision backend what's on screen
-            let state;
-            try {
-                state = await this.callBackend('/check_browser_state', { screenshot: b64 });
-            } catch { break; }
-
-            if (!state || state.state === 'clear' || state.state === 'loading') break;
-
-            // 3. Act on the result
-            if (state.can_auto_handle && state.auto_selector) {
-                this.addMessage(`👁️ Detected: **${state.description}** — auto-handling...`, 'system');
-                await window.electronAPI.executeAction({
-                    action: 'browser_click', params: { selector: state.auto_selector }
-                });
-                await this.delay(1500);
-                // Also try DOM-based fast handler
-                await window.electronAPI.executeAction({
-                    action: 'browser_auto_handle_blockers', params: {}
-                });
-                await this.delay(800);
-                // Loop again to check if another blocker appeared
-                continue;
-            }
-
-            if (state.needs_user) {
-                this.addMessage(`⚠️ **Action required:** ${state.user_message || state.description}`, 'assistant');
-                // If it's 2FA, show an input form for the code
-                if (state.state === '2fa') {
-                    this.showClarificationForm(
-                        state.user_message || 'Enter the 2FA code:',
-                        [{ key: 'otp_code', label: '2FA / OTP Code', placeholder: 'e.g. 123456', default: '' }]
-                    );
-                }
-                break; // Stop watching — waiting for user
-            }
-
-            break;
-        }
-    }
-
-    // ============================================
-    // Action Execution
-    // ============================================
-
-    async executeActions(actions) {
-        const results = [];
-        
-        // Reset stop flag and show stop button
-        await window.electronAPI.resetStopFlag();
-        this.showStopButton();
-        
-        for (let i = 0; i < actions.length; i++) {
-            // Check if user requested stop
-            const isStopped = await window.electronAPI.checkStopFlag();
-            if (isStopped) {
-                this.addMessage('⏹ Execution stopped by user', 'system');
-                this.hideStopButton();
-                return results;
-            }
-            
-            const action = actions[i];
-            const actionName = action.name || action.function?.name;
-            const params = action.parameters || action.arguments || {};
-            
-            this.showActionStatus(`Executing: ${actionName} (${i + 1}/${actions.length})`);
-            
-            try {
-                // Execute action
-                const result = await this.executeAction(actionName, params);
-                
-                // Show result
-                if (result && result.blocked) {
-                    this.addActionResult(actionName, params, 'blocked', result.error);
-                } else if (result && result.success === false) {
-                    this.addActionResult(actionName, params, 'error', result.error);
-                } else {
-                    this.addActionResult(actionName, params, 'success', result?.message);
-                }
-                
-                results.push({ action: actionName, result });
-
-                // After any browser action, watch screen for blockers
-                const isBrowserAction = actionName.startsWith('browser_') || actionName === 'web_login';
-                if (isBrowserAction && result && result.success !== false) {
-                    await this.delay(1800); // let page settle
-                    await this.watchBrowserAfterAction();
-                }
-
-                // Smart delay between actions based on action type
-                const delayTime = this.getActionDelay(actionName);
-                if (i < actions.length - 1) {
-                    await this.delay(delayTime);
-                }
-                
-            } catch (error) {
-                console.error(`Action failed: ${actionName}`, error);
-                this.addActionResult(actionName, params, 'error', error.message);
-                results.push({ action: actionName, error: error.message });
-            }
-        }
-        
-        // Hide stop button when done
-        this.hideStopButton();
-        
-        // Summary
-        const successful = results.filter(r => r.result && r.result.success !== false).length;
-        const failed = results.length - successful;
-        
-        if (failed === 0) {
-            this.addMessage(`✅ All ${results.length} action(s) completed successfully!`, 'system');
-        } else {
-            this.addMessage(`⚠️ Completed: ${successful} success, ${failed} failed`, 'system');
-        }
-
-        // Show task summary if AI provided one
-        if (this.currentTaskSummary) {
-            this.showTaskSummary(this.currentTaskSummary, results);
-            this.currentTaskSummary = null;
-        }
-        
-        // FEEDBACK LOOP: Verify task completion if enabled
-        if (this.feedbackLoopEnabled && this.expectedResult) {
-            await this.verifyAndRetry();
-        }
-        
-        return results;
-    }
-    
-    // ============================================
-    // Feedback Loop - Verify & Retry
-    // ============================================
-    
-    async verifyAndRetry() {
-        if (!this.feedbackLoopEnabled || this.currentRetry >= this.maxRetries) {
-            return;
-        }
-        
-        this.addMessage('🔍 Verifying task completion...', 'system');
-        this.showActionStatus('Verifying task...');
-        
-        // Take a new screenshot to verify
-        await this.delay(1500); // Wait for UI to settle
-        const screenshotData = await window.electronAPI.takeScreenshot();
-        
-        if (!screenshotData || !screenshotData.screenshot) {
-            this.addMessage('⚠️ Could not capture verification screenshot', 'system');
-            return;
-        }
-        
-        try {
-            // Call verify endpoint
-            const verifyResponse = await this.callBackend('/verify', {
-                screenshot: screenshotData.screenshot,
-                task: this.currentTask,
-                expected_result: this.expectedResult
-            });
-            
-            if (verifyResponse.error) {
-                this.addMessage(`⚠️ Verification error: ${verifyResponse.error}`, 'system');
-                return;
-            }
-            
-            if (verifyResponse.success) {
-                this.addMessage('✅ Task verified as complete!', 'system');
-                this.currentRetry = 0; // Reset
-                return;
-            }
-            
-            // Task not complete
-            if (verifyResponse.should_retry && verifyResponse.retry_actions?.length > 0) {
-                this.currentRetry++;
-                this.addMessage(
-                    `🔄 Task incomplete. ${verifyResponse.observation || ''}\nRetrying... (${this.currentRetry}/${this.maxRetries})`,
-                    'system'
-                );
-                
-                // Execute retry actions
-                if (this.previewMode) {
-                    this.showPreviewActions(verifyResponse.retry_actions, 1);
-                } else {
-                    await this.executeActions(verifyResponse.retry_actions);
-                }
-            } else {
-                this.addMessage(
-                    `⚠️ Task may be incomplete: ${verifyResponse.observation || 'Unknown state'}`,
-                    'system'
-                );
-            }
-            
-        } catch (error) {
-            console.error('Verification error:', error);
-            this.addMessage(`⚠️ Verification failed: ${error.message}`, 'system');
-        } finally {
-            this.hideActionStatus();
-        }
-    }
-
-    // Get appropriate delay based on action type
-    getActionDelay(actionName) {
-        // Actions that need more time (app opening, typing)
-        const longDelayActions = [
-            'open_application', 'open-app', 'open_app', 'launch_app', 'launch_application'
-        ];
-        
-        // Actions that need medium delay (typing, clicks)
-        const mediumDelayActions = [
-            'type_text', 'type-text', 'type', 'type_into_app',
-            'click', 'click_at', 'press_key', 'press-key', 'press', 'hotkey'
-        ];
-        
-        if (longDelayActions.includes(actionName)) {
-            return 2000; // 2 seconds for app to fully open
-        } else if (mediumDelayActions.includes(actionName)) {
-            return 500; // 500ms after typing/clicking
-        } else {
-            return 300; // Default delay
-        }
-    }
-    
-    addActionResult(actionName, params, status, message) {
-        const resultDiv = document.createElement('div');
-        resultDiv.className = `action-result ${status}`;
-        
-        let statusIcon = '✅';
-        if (status === 'blocked') statusIcon = '🛡️';
-        else if (status === 'error') statusIcon = '❌';
-        
-        resultDiv.innerHTML = `
-            <div class="action-name">${statusIcon} ${actionName}</div>
-            <div class="action-params">${JSON.stringify(params, null, 2)}</div>
-            ${message ? `<div class="action-message">${message}</div>` : ''}
-        `;
-        
-        this.elements.chatContainer.appendChild(resultDiv);
-        this.scrollToBottom();
-    }
-    
-    async executeAction(actionName, params) {
-        // Special: get_screenshot / describe_screen — take screenshot, send to AI for vision analysis
-        const visionActions = ['get_screenshot', 'describe_screen', 'what_is_on_screen', 'analyze_screen', 'screenshot_analyze'];
-        if (visionActions.includes(actionName)) {
-            try {
-                const screenshotData = await window.electronAPI.takeScreenshot();
-                if (!screenshotData || !screenshotData.screenshot) {
-                    return { success: false, error: 'Could not capture screenshot' };
-                }
-                // Use dedicated /analyze_screen endpoint (Gemini vision)
-                const response = await this.callBackend('/analyze_screen', {
-                    screenshot: screenshotData.screenshot,
-                    question: params.question || params.query || 'Describe exactly what is visible on my screen right now. List open windows, content, and any important details.'
-                });
-                if (response.error) return { success: false, error: response.error };
-                const answer = response.answer || response.description || 'No description available';
-                this.addMessage(`👁️ **Screen Analysis:**\n${answer}`, 'assistant');
-                return { success: true, message: answer };
-            } catch (e) {
-                return { success: false, error: e.message };
-            }
-        }
-
-        // Execute all other actions locally through main process
-        try {
-            const result = await window.electronAPI.executeAction({
-                action: actionName,
-                params: params
-            });
-            return result;
-        } catch (error) {
-            console.error(`Action ${actionName} failed:`, error);
-            return {
-                success: false,
-                error: error.message || 'Action execution failed'
-            };
-        }
-    }
-    
-    delay(ms) {
-        return new Promise(resolve => setTimeout(resolve, ms));
-    }
-    
-    // ============================================
-    // API Communication
-    // ============================================
-    
-    async callBackend(endpoint, data) {
-        try {
-            const response = await fetch(`${this.settings.colabUrl}${endpoint}`, {
-                method: 'POST',
-                headers: {
-                    'Content-Type': 'application/json',
-                    'Accept': 'application/json',
-                    'ngrok-skip-browser-warning': 'true'  // Bypass ngrok warning
-                },
-                body: JSON.stringify(data)
-            });
-            
-            if (!response.ok) {
-                throw new Error(`HTTP error! status: ${response.status}`);
-            }
-            
-            const contentType = response.headers.get('content-type');
-            if (!contentType || !contentType.includes('application/json')) {
-                throw new Error('Server returned HTML instead of JSON. Open the ngrok URL in your browser first and click "Visit Site".');
-            }
-            
-            return await response.json();
-        } catch (error) {
-            return { error: error.message };
-        }
-    }
-    
-    async checkConnection() {
-        if (!this.settings.colabUrl) {
-            this.setConnectionStatus('disconnected');
-            return;
-        }
-        
-        this.setConnectionStatus('connecting');
-        
-        try {
-            const response = await fetch(`${this.settings.colabUrl}/health`, {
-                method: 'GET',
-                headers: {
-                    'ngrok-skip-browser-warning': 'true'
-                },
-                timeout: 5000
-            });
-            
-            if (response.ok) {
-                this.setConnectionStatus('connected');
-            } else {
-                this.setConnectionStatus('disconnected');
-            }
-        } catch (error) {
-            this.setConnectionStatus('disconnected');
-        }
-    }
-    
-    setConnectionStatus(status) {
-        this.elements.statusIndicator.className = 'status-indicator';
-        
-        switch (status) {
-            case 'connected':
-                this.elements.statusIndicator.classList.add('connected');
-                this.elements.statusIndicator.title = 'Connected to backend';
-                break;
-            case 'connecting':
-                this.elements.statusIndicator.classList.add('connecting');
-                this.elements.statusIndicator.title = 'Connecting...';
-                break;
-            case 'disconnected':
-                this.elements.statusIndicator.classList.add('disconnected');
-                this.elements.statusIndicator.title = 'Disconnected';
-                break;
-        }
-    }
-    
-    // ============================================
-    // Interactive Choice Handling
-    // ============================================
-    
-    async handleChoiceRequest(response) {
-        // Execute detection actions first (e.g., detect_browsers)
-        if (response.actions && response.actions.length > 0) {
-            this.showActionStatus('Detecting available options...');
-            
-            for (const action of response.actions) {
-                const actionName = action.name || action.function?.name;
-                const params = action.parameters || action.arguments || {};
-                
-                const result = await this.executeAction(actionName, params);
-                
-                // Store detected options
-                if (result.success) {
-                    if (result.browsers) {
-                        this.choiceOptions = result.browsers;
-                    } else if (result.profiles) {
-                        this.choiceOptions = result.profiles;
-                    }
-                }
-            }
-            
-            this.hideActionStatus();
-        }
-        
-        // Set choice state
-        this.waitingForChoice = true;
-        this.choiceType = response.choice_type;
-        this.pendingTask = response.pending_task;
-        
-        // Display choice UI
-        this.showChoiceUI(response.message, this.choiceOptions);
-    }
-    
-    showChoiceUI(question, options) {
-        // Create choice container
-        const choiceDiv = document.createElement('div');
-        choiceDiv.className = 'choice-container';
-        choiceDiv.id = 'choiceContainer';
-        
-        let html = `
-            <div class="choice-banner">🤔 AI needs your help</div>
-            <div class="choice-question">${question}</div>
-            <div class="choice-options">
-        `;
-        
-        options.forEach((option, index) => {
-            html += `
-                <button class="choice-option-btn" data-choice="${option}">
-                    ${option}
-                </button>
-            `;
-        });
-        
-        html += `
-            </div>
-        `;
-        
-        choiceDiv.innerHTML = html;
-        this.elements.chatContainer.appendChild(choiceDiv);
-        this.scrollToBottom();
-        
-        // Add event listeners to all choice buttons
-        document.querySelectorAll('.choice-option-btn').forEach(btn => {
-            btn.addEventListener('click', (e) => {
-                const choice = e.target.getAttribute('data-choice');
-                this.handleUserChoice(choice);
-            });
+            bubble.querySelector('.edit-btn').addEventListener('click', () => startEdit(msgEl, originalText));
         });
     }
-    
-    async handleUserChoice(choice) {
-        // Remove choice UI
-        const choiceContainer = document.getElementById('choiceContainer');
-        if (choiceContainer) {
-            choiceContainer.remove();
-        }
-        
-        // Add user's choice as a message
-        this.addMessage(`You chose: ${choice}`, 'user');
-        
-        // Store the choice
-        const chosenOption = choice;
-        const choiceType = this.choiceType;
-        const pendingTask = this.pendingTask;
-        
-        // Reset choice state
-        this.waitingForChoice = false;
-        this.choiceType = null;
-        this.choiceOptions = [];
-        this.pendingTask = null;
-        
-        // Continue the task with the chosen option
-        this.isProcessing = true;
-        this.showTypingIndicator();
-        this.showActionStatus('Continuing with your choice...');
-        
-        try {
-            // If we just chose a browser, now ask for profile
-            if (choiceType === 'browser') {
-                // Send follow-up to get profiles for chosen browser
-                const followUpMessage = `I chose ${chosenOption}. ${pendingTask}`;
-                
-                const response = await this.callBackend('/chat', {
-                    message: followUpMessage,
-                    conversation_history: [
-                        ...this.conversationHistory.slice(-10),
-                        { role: 'user', content: `Selected browser: ${chosenOption}` }
-                    ],
-                    screen_width: (await window.electronAPI.getScreenInfo()).width,
-                    screen_height: (await window.electronAPI.getScreenInfo()).height,
-                    user_choice: { type: 'browser', value: chosenOption }
-                });
-                
-                this.hideTypingIndicator();
-                
-                // Handle the response (might be another choice or action)
-                if (response.requires_choice) {
-                    await this.handleChoiceRequest(response);
-                } else {
-                    if (response.message) {
-                        this.addMessage(response.message, 'assistant');
-                    }
-                    
-                    if (response.actions && response.actions.length > 0) {
-                        if (this.previewMode) {
-                            this.showPreviewActions(response.actions);
-                        } else {
-                            await this.executeActions(response.actions);
+
+    // ─── TASK CARDS ─────────────────────────────────────────────
+    function renderTaskCards(tasks) {
+        const container = document.createElement('div');
+        container.className = 'task-container';
+
+        tasks.forEach((task, idx) => {
+            const card = document.createElement('div');
+            card.className = 'task-card';
+            card.id = `task-card-${task.id}`;
+            card.innerHTML = `
+                <div class="task-header">
+                    <div class="task-number">${task.id}</div>
+                    <div class="task-title">${escapeHtml(task.description)}</div>
+                    <div class="task-status">${task.needs_input ? 'Needs Info' : 'Pending'}</div>
+                </div>
+                <div class="task-actions-list"></div>`;
+            container.appendChild(card);
+        });
+
+        chatContainer.appendChild(container);
+        scrollToBottom();
+        return container;
+    }
+
+    function updateTaskCard(taskId, status, statusText) {
+        const card = $(`#task-card-${taskId}`);
+        if (!card) return;
+        card.className = `task-card ${status}`;
+        const st = card.querySelector('.task-status');
+        if (st) st.textContent = statusText || status;
+    }
+
+    function addActionToTaskCard(taskId, actionDesc, state = 'running') {
+        const card = $(`#task-card-${taskId}`);
+        if (!card) return;
+        const list = card.querySelector('.task-actions-list');
+        if (!list) return;
+        const item = document.createElement('div');
+        item.className = `task-action-item ${state}`;
+        item.innerHTML = `<span class="action-icon">${state === 'running' ? '<div class="spinner-sm"></div>' : state === 'complete' ? '✓' : '✗'}</span> ${escapeHtml(actionDesc)}`;
+        list.appendChild(item);
+        scrollToBottom();
+        return item;
+    }
+
+    function completeActionItem(item, success = true) {
+        if (!item) return;
+        item.className = `task-action-item ${success ? 'complete' : 'failed'}`;
+        const icon = item.querySelector('.action-icon');
+        if (icon) icon.innerHTML = success ? '✓' : '✗';
+    }
+
+    // ─── USER INPUT FORM ────────────────────────────────────────
+    function showInputForm(task) {
+        return new Promise((resolve) => {
+            const form = document.createElement('div');
+            form.className = 'input-form-card';
+            let fieldsHtml = `<h4>📝 Input needed: ${escapeHtml(task.description)}</h4>`;
+
+            (task.input_fields || []).forEach(field => {
+                const isTextarea = field.key === 'content' || field.key === 'body' || field.key === 'message';
+                fieldsHtml += `
+                    <div class="form-field">
+                        <label>${escapeHtml(field.label || field.key)}</label>
+                        ${isTextarea
+                            ? `<textarea data-key="${field.key}" placeholder="${escapeHtml(field.placeholder || '')}">${escapeHtml(field.default || '')}</textarea>`
+                            : `<input type="text" data-key="${field.key}" placeholder="${escapeHtml(field.placeholder || '')}" value="${escapeHtml(field.default || '')}">`
                         }
-                    }
-                }
-                
-            } else if (choiceType === 'account') {
-                // Final step - execute the task with chosen account
-                const followUpMessage = `Use account: ${chosenOption}. ${pendingTask}`;
-                
-                const response = await this.callBackend('/chat', {
-                    message: followUpMessage,
-                    conversation_history: [
-                        ...this.conversationHistory.slice(-10),
-                        { role: 'user', content: `Selected account: ${chosenOption}` }
-                    ],
-                    screen_width: (await window.electronAPI.getScreenInfo()).width,
-                    screen_height: (await window.electronAPI.getScreenInfo()).height,
-                    user_choice: { type: 'account', value: chosenOption }
-                });
-                
-                this.hideTypingIndicator();
-                
-                if (response.message) {
-                    this.addMessage(response.message, 'assistant');
-                }
-                
-                if (response.actions && response.actions.length > 0) {
-                    if (this.previewMode) {
-                        this.showPreviewActions(response.actions);
-                    } else {
-                        await this.executeActions(response.actions);
-                    }
-                }
-            }
-            
-        } catch (error) {
-            this.hideTypingIndicator();
-            this.addMessage(`Error: ${error.message}`, 'error');
-        } finally {
-            this.isProcessing = false;
-            this.hideActionStatus();
-        }
-    }
-    
-    // ============================================
-    // Settings Functions
-    // ============================================
-    
-    showSettings() {
-        this.elements.chatView.classList.remove('active');
-        this.elements.settingsView.classList.add('active');
-    }
-    
-    hideSettings() {
-        this.elements.settingsView.classList.remove('active');
-        this.elements.chatView.classList.add('active');
-    }
-    
-    async saveSettings() {
-        const newSettings = {
-            colabUrl: this.elements.colabUrl.value.trim().replace(/\/$/, ''), // Remove trailing slash
-            screenshotInterval: parseInt(this.elements.screenshotInterval.value),
-            screenshotQuality: parseInt(this.elements.screenshotQuality.value),
-            autoScreenshot: this.elements.autoCaptureToggle.checked
-        };
-        
-        await window.electronAPI.saveSettings(newSettings);
-        this.settings = { ...this.settings, ...newSettings };
-        
-        // Check connection with new URL
-        await this.checkConnection();
-        
-        this.hideSettings();
-        this.addMessage('Settings saved!', 'system');
-    }
-    
-    async testConnection() {
-        const url = this.elements.colabUrl.value.trim().replace(/\/$/, '');
-        
-        if (!url) {
-            this.showConnectionResult(false, 'Please enter a URL');
-            return;
-        }
-        
-        this.elements.testConnectionBtn.textContent = 'Testing...';
-        this.elements.testConnectionBtn.disabled = true;
-        
-        try {
-            const response = await fetch(`${url}/health`, {
-                method: 'GET',
-                headers: {
-                    'Accept': 'application/json',
-                    'ngrok-skip-browser-warning': 'true'  // Skip ngrok warning page
-                }
+                    </div>`;
             });
-            
-            if (response.ok) {
-                const contentType = response.headers.get('content-type');
-                if (contentType && contentType.includes('application/json')) {
-                    const data = await response.json();
-                    this.showConnectionResult(true, `Connected! Status: ${data.status}`);
-                } else {
-                    // Got HTML instead of JSON (ngrok warning page)
-                    this.showConnectionResult(false, 'Ngrok warning page detected. Open URL in browser first, click "Visit Site", then try again.');
+
+            fieldsHtml += `
+                <div class="form-actions">
+                    <button class="form-submit">Submit & Continue</button>
+                    <button class="form-skip">Skip Task</button>
+                </div>`;
+
+            form.innerHTML = fieldsHtml;
+            chatContainer.appendChild(form);
+            scrollToBottom();
+
+            // Focus first input
+            const firstInput = form.querySelector('input, textarea');
+            if (firstInput) firstInput.focus();
+
+            form.querySelector('.form-submit').addEventListener('click', () => {
+                const values = {};
+                form.querySelectorAll('[data-key]').forEach(el => {
+                    values[el.dataset.key] = el.value;
+                });
+                form.remove();
+                resolve({ submitted: true, values });
+            });
+
+            form.querySelector('.form-skip').addEventListener('click', () => {
+                form.remove();
+                resolve({ submitted: false, values: {} });
+            });
+        });
+    }
+
+    // ─── SEND MESSAGE ───────────────────────────────────────────
+    async function sendMessage(text) {
+        if (!text || isProcessing) return;
+        isProcessing = true;
+        shouldStop = false;
+        sendBtn.disabled = true;
+
+        addMessage(text, 'user');
+        conversationHistory.push({ role: 'user', content: text });
+
+        const thinkingEl = addThinking();
+        showProgress('Planning tasks...', 5);
+
+        try {
+            await window.electronAPI.resetStopFlag();
+
+            // Take screenshot
+            let screenshotB64 = null;
+            try {
+                const ssData = await window.electronAPI.takeScreenshot();
+                if (ssData && ssData.screenshot) screenshotB64 = ssData.screenshot;
+            } catch (e) {
+                console.warn('Screenshot failed:', e);
+            }
+
+            // Call backend
+            const resp = await fetch(`${backendUrl}/chat`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    message: text,
+                    screenshot: screenshotB64,
+                    conversation_history: conversationHistory.slice(-10),
+                    screen_width: screenWidth,
+                    screen_height: screenHeight,
+                    user_home: userHome,
+                }),
+            });
+
+            if (!resp.ok) {
+                throw new Error(`Backend error: ${resp.status} ${resp.statusText}`);
+            }
+
+            const data = await resp.json();
+            removeThinking();
+
+            // Show AI message
+            if (data.message) {
+                addMessage(data.message, 'ai');
+                conversationHistory.push({ role: 'assistant', content: data.message });
+            }
+
+            const tasks = data.tasks || [];
+            if (tasks.length === 0) {
+                hideProgress();
+                isProcessing = false;
+                sendBtn.disabled = false;
+                return;
+            }
+
+            // Render task cards
+            renderTaskCards(tasks);
+
+            // Execute tasks sequentially
+            await executeTasks(tasks, data.expected_result, text);
+
+        } catch (err) {
+            removeThinking();
+            addMessage(`Error: ${err.message}`, 'ai');
+            console.error('Send error:', err);
+        }
+
+        hideProgress();
+        isProcessing = false;
+        sendBtn.disabled = false;
+    }
+
+    // ─── EXECUTE TASKS ──────────────────────────────────────────
+    async function executeTasks(tasks, expectedResult, originalMessage) {
+        const totalTasks = tasks.length;
+
+        for (let i = 0; i < tasks.length; i++) {
+            if (shouldStop) {
+                addMessage('⏹ Execution stopped by user.', 'ai');
+                break;
+            }
+
+            const task = tasks[i];
+            const pct = Math.round(((i) / totalTasks) * 100);
+            showProgress(`Task ${task.id}/${totalTasks}: ${task.description}`, pct);
+            updateTaskCard(task.id, 'running', 'Running...');
+
+            // Handle needs_input tasks
+            if (task.needs_input && task.input_fields && task.input_fields.length > 0) {
+                updateTaskCard(task.id, 'running', 'Waiting for input...');
+                const inputResult = await showInputForm(task);
+
+                if (!inputResult.submitted) {
+                    updateTaskCard(task.id, 'error', 'Skipped');
+                    continue;
                 }
-            } else {
-                this.showConnectionResult(false, `Server returned: ${response.status}`);
+
+                // Re-plan this task with user's input
+                const inputDesc = Object.entries(inputResult.values)
+                    .map(([k, v]) => `${k}: ${v}`)
+                    .join(', ');
+
+                try {
+                    const resp = await fetch(`${backendUrl}/chat`, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({
+                            message: `${task.description}. User provided: ${inputDesc}`,
+                            conversation_history: conversationHistory.slice(-6),
+                            screen_width: screenWidth,
+                            screen_height: screenHeight,
+                            user_home: userHome,
+                            user_choice: { type: 'input', value: inputResult.values },
+                        }),
+                    });
+                    const reData = await resp.json();
+                    // Replace task actions with new ones
+                    const reTasks = reData.tasks || [];
+                    if (reTasks.length > 0 && reTasks[0].actions) {
+                        task.actions = reTasks[0].actions;
+                        task.needs_input = false;
+                    }
+                } catch (e) {
+                    console.error('Re-plan error:', e);
+                    updateTaskCard(task.id, 'error', 'Re-plan failed');
+                    continue;
+                }
             }
-        } catch (error) {
-            let errorMsg = error.message;
-            if (errorMsg.includes('JSON')) {
-                errorMsg = '⚠️ Ngrok free tier issue: Open the URL in your browser, click "Visit Site" button, then try again.';
+
+            // Execute task actions
+            let taskSuccess = true;
+            const actions = task.actions || [];
+
+            for (let j = 0; j < actions.length; j++) {
+                if (shouldStop) break;
+
+                const action = actions[j];
+                const actionName = action.name || action.action || 'unknown';
+                const actionParams = action.parameters || action.params || {};
+                const actionDesc = actionParams.goal || actionParams.description || actionName;
+
+                showProgress(`Task ${task.id}: ${actionDesc}`, pct + Math.round(((j + 1) / actions.length) * (100 / totalTasks)));
+
+                if (actionName === 'vision_task') {
+                    // Vision task — screenshot loop
+                    const result = await executeVisionTask(
+                        actionParams.goal || task.description,
+                        actionParams.max_steps || 30,
+                        task.id
+                    );
+                    if (!result.success) taskSuccess = false;
+
+                } else if (actionName === 'generate_ppt') {
+                    // PPT generation — route through action-executor so shell.openPath fires
+                    const pptTopic = actionParams.topic || actionParams.title || task.description;
+                    const item = addActionToTaskCard(task.id, `Creating PPT: ${pptTopic}`);
+                    showProgress(`Generating presentation: ${pptTopic}...`, pct + 10);
+                    try {
+                        const result = await window.electronAPI.executeAction({
+                            action: 'generate_ppt',
+                            params: actionParams,
+                        });
+                        completeActionItem(item, result && result.success !== false);
+                        if (result && result.success !== false) {
+                            addMessage(`✅ Presentation created and opened:\n${result.path || ''}`, 'ai');
+                        } else {
+                            addMessage(`❌ PPT error: ${(result && result.error) || 'Unknown error'}`, 'ai');
+                            taskSuccess = false;
+                        }
+                    } catch (e) {
+                        completeActionItem(item, false);
+                        addMessage(`❌ PPT error: ${e.message}`, 'ai');
+                        taskSuccess = false;
+                    }
+
+                } else {
+                    // Regular action — execute via Electron
+                    const item = addActionToTaskCard(task.id, actionDesc);
+
+                    if (previewMode) {
+                        completeActionItem(item, true);
+                        await delay(300);
+                        continue;
+                    }
+
+                    try {
+                        const result = await window.electronAPI.executeAction({
+                            action: actionName,
+                            params: actionParams,
+                        });
+                        const success = result && result.success !== false;
+                        completeActionItem(item, success);
+                        if (!success) taskSuccess = false;
+
+                        // Small delay between actions
+                        await delay(500);
+                    } catch (e) {
+                        completeActionItem(item, false);
+                        taskSuccess = false;
+                        console.error(`Action ${actionName} error:`, e);
+                    }
+                }
             }
-            this.showConnectionResult(false, errorMsg);
-        } finally {
-            this.elements.testConnectionBtn.textContent = 'Test Connection';
-            this.elements.testConnectionBtn.disabled = false;
+
+            updateTaskCard(task.id, taskSuccess ? 'done' : 'error', taskSuccess ? 'Done' : 'Failed');
+        }
+
+        // Final progress
+        showProgress('All tasks complete', 100);
+
+        // Verify if we have expected result
+        if (expectedResult && !shouldStop) {
+            await verifyCompletion(originalMessage, expectedResult);
+        }
+
+        setTimeout(hideProgress, 2000);
+    }
+
+    // ─── VISION TASK LOOP ───────────────────────────────────────
+    async function executeVisionTask(goal, maxSteps = 30, taskId) {
+        const currentCogUrl = cogagentUrl.value.trim();
+        const useDirect = !!currentCogUrl;          // direct CogAgent when URL is set
+
+        if (!currentCogUrl) {
+            console.warn('[vision] No CogAgent URL set! Go to Settings and paste your Kaggle ngrok URL.');
+            addActionToTaskCard(taskId, '⚠️ No CogAgent URL set — open Settings and paste your Kaggle ngrok URL');
+        } else {
+            console.log('[vision] Using DIRECT CogAgent connection:', currentCogUrl);
+        }
+
+        const stepHistory = [];
+        let stepCount = 0;
+
+        showVisionOverlay(goal);
+
+        while (stepCount < maxSteps) {
+            if (shouldStop) {
+                hideVisionOverlay();
+                return { success: false, reason: 'Stopped by user' };
+            }
+
+            stepCount++;
+            const item = addActionToTaskCard(taskId, `Vision step ${stepCount}: analyzing screen...`);
+
+            try {
+                // Capture hi-res screenshot
+                const ssData = await window.electronAPI.takeScreenshotHires();
+                if (!ssData || !ssData.screenshot) {
+                    completeActionItem(item, false);
+                    hideVisionOverlay();
+                    return { success: false, reason: 'Screenshot failed' };
+                }
+                const screenshotB64 = ssData.screenshot;
+
+                let action;
+
+                if (useDirect) {
+                    // ── DIRECT: main-process IPC → CogAgent Kaggle (120s timeout) ──
+                    action = await window.electronAPI.cogagentVisionAct({
+                        screenshot:    screenshotB64,
+                        goal,
+                        step_history:  stepHistory,
+                        screen_width:  screenWidth,
+                        screen_height: screenHeight,
+                    });
+                } else {
+                    // ── FALLBACK: proxy through langchain backend ──────────────────
+                    const resp = await fetch(`${backendUrl}/vision_act`, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({
+                            screenshot: screenshotB64,
+                            goal,
+                            step_history: stepHistory,
+                            screen_width: screenWidth,
+                            screen_height: screenHeight,
+                            cogagent_url: cogagentUrl.value.trim() || undefined,
+                        }),
+                    });
+
+                    if (!resp.ok) {
+                        completeActionItem(item, false);
+                        continue;
+                    }
+                    action = await resp.json();
+                }
+
+                // Update step display
+                updateVisionStep(`Step ${stepCount}: ${action.description || action.action}`);
+
+                // Check for done/fail
+                if (action.action === 'done') {
+                    completeActionItem(item, true);
+                    item.querySelector('.action-icon').nextSibling.textContent = ` ✅ ${action.description || 'Task complete'}`;
+                    stepHistory.push({ ...action, success: true });
+                    hideVisionOverlay();
+                    return { success: true, steps: stepCount };
+                }
+
+                if (action.action === 'fail') {
+                    completeActionItem(item, false);
+                    item.querySelector('.action-icon').nextSibling.textContent = ` ❌ ${action.description || 'Cannot proceed'}`;
+                    stepHistory.push({ ...action, success: false });
+                    hideVisionOverlay();
+                    return { success: false, reason: action.description, steps: stepCount };
+                }
+
+                // Execute the vision action via screen-agent
+                const execResult = await window.electronAPI.executeAction({
+                    action: 'vision_execute',
+                    params: action,
+                });
+
+                const success = execResult && execResult.success !== false;
+                completeActionItem(item, success);
+                item.querySelector('.action-icon').nextSibling.textContent = ` ${action.description || action.action}`;
+
+                stepHistory.push({ ...action, success });
+
+                // Wait for screen to settle
+                await delay(1200);
+
+            } catch (e) {
+                completeActionItem(item, false);
+                console.error('Vision step error:', e);
+                stepHistory.push({ action: 'error', description: e.message, success: false });
+            }
+        }
+
+        hideVisionOverlay();
+        return { success: false, reason: `Max steps (${maxSteps}) reached`, steps: stepCount };
+    }
+
+    // ─── VISION OVERLAY ─────────────────────────────────────────
+    function showVisionOverlay(goal) {
+        let overlay = $('.vision-overlay');
+        if (!overlay) {
+            overlay = document.createElement('div');
+            overlay.className = 'vision-overlay';
+            document.body.appendChild(overlay);
+        }
+        overlay.innerHTML = `
+            <h4><div class="spinner-sm"></div> Vision Agent</h4>
+            <div class="vision-step active">${escapeHtml(goal)}</div>`;
+        overlay.classList.add('visible');
+    }
+
+    function updateVisionStep(text) {
+        const overlay = $('.vision-overlay');
+        if (!overlay) return;
+        const step = document.createElement('div');
+        step.className = 'vision-step active';
+        step.textContent = text;
+        // Keep only last 4 steps visible
+        const steps = overlay.querySelectorAll('.vision-step');
+        if (steps.length > 4) steps[0].remove();
+        overlay.appendChild(step);
+    }
+
+    function hideVisionOverlay() {
+        const overlay = $('.vision-overlay');
+        if (overlay) overlay.classList.remove('visible');
+    }
+
+    // ─── VERIFY COMPLETION ──────────────────────────────────────
+    async function verifyCompletion(task, expectedResult) {
+        try {
+            const ssData = await window.electronAPI.takeScreenshot();
+            const screenshotB64 = ssData && ssData.screenshot ? ssData.screenshot : null;
+            const resp = await fetch(`${backendUrl}/verify`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ screenshot: screenshotB64, task, expected_result: expectedResult }),
+            });
+            const data = await resp.json();
+            if (data.success) {
+                addMessage(`✅ Verified: ${data.observation || 'Task completed successfully'}`, 'ai');
+            } else if (data.should_retry) {
+                addMessage(`⚠️ Verification: ${data.observation}. I can retry if needed.`, 'ai');
+            }
+        } catch (e) {
+            console.warn('Verify error:', e);
         }
     }
-    
-    showConnectionResult(success, message) {
-        this.elements.connectionStatus.className = `connection-status ${success ? 'success' : 'error'}`;
-        this.elements.connectionStatus.textContent = message;
-    }
-}
 
-// Initialize app when DOM is ready
-document.addEventListener('DOMContentLoaded', () => {
-    window.pecifics = new PecificsApp();
-});
+    // ─── PROGRESS ───────────────────────────────────────────────
+    function showProgress(text, pct = 0) {
+        progressArea.classList.add('visible');
+        progressText.textContent = text;
+        progressFill.style.width = `${Math.min(pct, 100)}%`;
+    }
+
+    function hideProgress() {
+        progressArea.classList.remove('visible');
+        progressFill.style.width = '0%';
+        progressText.textContent = 'Ready';
+    }
+
+    // ─── SETTINGS ───────────────────────────────────────────────
+    function showSettings() {
+        chatView.style.display = 'none';
+        chatView.classList.remove('active');
+        settingsView.style.display = 'flex';
+        settingsView.classList.add('active');
+    }
+
+    function showChat() {
+        settingsView.style.display = 'none';
+        settingsView.classList.remove('active');
+        chatView.style.display = 'flex';
+        chatView.classList.add('active');
+    }
+
+    settingsBtn.addEventListener('click', () => showSettings());
+    backBtn.addEventListener('click', () => showChat());
+
+    testConnectionBtn.addEventListener('click', async () => {
+        const url = colabUrl.value.trim() || 'http://localhost:8000';
+        const cogUrl = cogagentUrl.value.trim();
+        connectionStatus.textContent = 'Testing...';
+        connectionStatus.className = 'conn-status';
+        connectionStatus.style.display = 'block';
+
+        const results = [];
+
+        // Test LangChain backend
+        try {
+            const resp = await fetch(`${url}/health`, { signal: AbortSignal.timeout(5000) });
+            if (resp.ok) {
+                const data = await resp.json();
+                results.push(`✓ LLM Backend — ${data.llm}`);
+            } else {
+                results.push(`✗ LLM Backend — HTTP ${resp.status}`);
+            }
+        } catch (e) {
+            results.push(`✗ LLM Backend — cannot reach ${url}`);
+        }
+
+        // Test CogAgent direct
+        if (cogUrl) {
+            try {
+                const cogHealth = await window.electronAPI.cogagentHealth();
+                if (cogHealth.ok) {
+                    results.push(`✓ CogAgent — ${cogHealth.data.model || 'connected'}`);
+                } else {
+                    results.push(`✗ CogAgent — ${cogHealth.error}`);
+                }
+            } catch (e) {
+                results.push(`✗ CogAgent — ${e.message}`);
+            }
+        } else {
+            results.push('⚠ CogAgent — no URL set');
+        }
+
+        const allOk = results.every(r => r.startsWith('✓'));
+        connectionStatus.textContent = results.join('  |  ');
+        connectionStatus.className = `conn-status ${allOk ? 'ok' : 'fail'}`;
+    });
+
+    saveSettingsBtn.addEventListener('click', async () => {
+        const settings = {
+            colabUrl: colabUrl.value.trim() || 'http://localhost:8000',
+            cogagentUrl: cogagentUrl.value.trim(),
+            screenshotInterval: parseInt($('#screenshotInterval').value) || 1000,
+            screenshotQuality: parseInt(qualityRange.value) || 80,
+            autoCapture: $('#autoCaptureToggle').checked,
+            alwaysOnTop: $('#alwaysOnTop').checked,
+        };
+        backendUrl = settings.colabUrl;
+        await window.electronAPI.saveSettings(settings);
+        window.electronAPI.toggleAlwaysOnTop(settings.alwaysOnTop);
+
+        // Push CogAgent URL to backend so it persists in memory
+        if (settings.cogagentUrl) {
+            try {
+                await fetch(`${backendUrl}/set_config`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ cogagent_url: settings.cogagentUrl }),
+                });
+            } catch(e) { console.warn('Could not push config to backend:', e); }
+        }
+        checkBackendConnection();
+
+        // Flash save button
+        saveSettingsBtn.textContent = 'Saved ✓';
+        setTimeout(() => { saveSettingsBtn.textContent = 'Save Settings'; }, 1500);
+    });
+
+    qualityRange.addEventListener('input', () => {
+        qualityValue.textContent = `${qualityRange.value}%`;
+    });
+
+    // ─── WINDOW CONTROLS ────────────────────────────────────────
+    minimizeBtn.addEventListener('click', () => window.electronAPI.minimizeWindow());
+    closeBtn.addEventListener('click', () => window.electronAPI.closeWindow());
+
+    // ─── INPUT ──────────────────────────────────────────────────
+    messageInput.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter' && !e.shiftKey) {
+            e.preventDefault();
+            const text = messageInput.value.trim();
+            if (text && !isProcessing) {
+                messageInput.value = '';
+                messageInput.style.height = 'auto';
+                sendMessage(text);
+            }
+        }
+    });
+
+    // Auto-resize textarea
+    messageInput.addEventListener('input', () => {
+        messageInput.style.height = 'auto';
+        messageInput.style.height = Math.min(messageInput.scrollHeight, 120) + 'px';
+    });
+
+    sendBtn.addEventListener('click', () => {
+        const text = messageInput.value.trim();
+        if (text && !isProcessing) {
+            messageInput.value = '';
+            messageInput.style.height = 'auto';
+            sendMessage(text);
+        }
+    });
+
+    stopBtn.addEventListener('click', async () => {
+        shouldStop = true;
+        try { await window.electronAPI.stopExecution(); } catch (e) {}
+        addMessage('⏹ Stopping...', 'ai');
+    });
+
+    // Preview toggle
+    previewToggle.addEventListener('change', () => {
+        previewMode = previewToggle.checked;
+        modeLabel.textContent = previewMode ? 'Preview Mode' : 'Live Mode';
+    });
+
+    // Quick action buttons
+    document.querySelectorAll('.quick-btn').forEach(btn => {
+        btn.addEventListener('click', () => {
+            const prompt = btn.dataset.prompt;
+            if (prompt && !isProcessing) {
+                sendMessage(prompt);
+            }
+        });
+    });
+
+    // Show settings from system event
+    window.electronAPI.onShowSettings(() => {
+        showSettings();
+    });
+
+    // ─── HELPERS ────────────────────────────────────────────────
+    function escapeHtml(str) {
+        if (!str) return '';
+        const div = document.createElement('div');
+        div.textContent = str;
+        return div.innerHTML;
+    }
+
+    function scrollToBottom() {
+        requestAnimationFrame(() => {
+            chatContainer.scrollTop = chatContainer.scrollHeight;
+        });
+    }
+
+    function delay(ms) {
+        return new Promise(r => setTimeout(r, ms));
+    }
+
+    // ─── BOOT ───────────────────────────────────────────────────
+    init();
+
+})();

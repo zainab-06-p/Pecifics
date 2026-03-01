@@ -18,6 +18,7 @@ const fileManager = require('./file-manager');
 const systemManager = require('./system-manager');
 const osTasks = require('./os-tasks');
 const browserAutomation = require('./browser-automation');
+const screenAgent = require('./screen-agent');
 
 // PowerShell helper class for mouse/keyboard operations (loaded once)
 const PS_HELPER_SCRIPT = `
@@ -392,6 +393,58 @@ class ActionExecutor {
             const { shell } = require('electron');
             await shell.openPath(finalPath);
             return { success: true, message: `Presentation created and opened: ${finalPath}`, path: finalPath };
+        } catch (error) {
+            return { success: false, error: error.message };
+        }
+    }
+
+    /**
+     * Generate a Gamma-quality PPT via the backend LLM + ppt_generator_pro.
+     * The backend creates the .pptx file and returns its path.
+     * We then open it for the user and flag ask_for_edits=true.
+     */
+    async generatePPT(params) {
+        try {
+            const http = require('http');
+            const backendUrl = 'http://localhost:8000';
+            const body = JSON.stringify({
+                topic: params.topic || params.title || 'Presentation',
+                title: params.title || params.topic || 'Presentation',
+                num_slides: params.num_slides || params.slides || 5,
+                theme: params.theme || 'gamma_modern',
+                save_path: params.save_path || 'Desktop',
+                additional_instructions: params.additional_instructions || params.instructions || null,
+            });
+
+            const result = await new Promise((resolve, reject) => {
+                const req = http.request(`${backendUrl}/generate_ppt`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) },
+                }, res => {
+                    let data = '';
+                    res.on('data', c => data += c);
+                    res.on('end', () => {
+                        try { resolve(JSON.parse(data)); } catch { reject(new Error(data)); }
+                    });
+                });
+                req.on('error', reject);
+                req.setTimeout(120000, () => { req.destroy(); reject(new Error('PPT generation timed out (120s)')); });
+                req.write(body);
+                req.end();
+            });
+
+            if (result.success && result.path) {
+                const filePath = result.path.replace(/\//g, '\\');
+                const { shell } = require('electron');
+                await shell.openPath(filePath);
+                return {
+                    success: true,
+                    message: result.message || `PPT created: ${filePath}`,
+                    path: filePath,
+                    ask_for_edits: true,
+                };
+            }
+            return { success: false, error: result.detail || result.error || 'PPT generation failed' };
         } catch (error) {
             return { success: false, error: error.message };
         }
@@ -1503,10 +1556,53 @@ class ActionExecutor {
     }
 
     // ============================================
+    // Path Resolution — fix USERNAME, ~, Desktop etc.
+    // ============================================
+
+    resolveFilePath(p) {
+        if (!p || typeof p !== 'string') return p;
+        const home = os.homedir();
+        const user = path.basename(home);
+        // Replace literal USERNAME or YOURUSERNAME with actual user
+        p = p.replace(/C:\\Users\\USERNAME/gi, home);
+        p = p.replace(/C:\\Users\\YOURUSERNAME/gi, home);
+        p = p.replace(/C:\\Users\\User/gi, home);
+        p = p.replace(/~\//g, home + '\\');
+        p = p.replace(/^~$/g, home);
+        // Replace standalone friendly names
+        if (/^desktop$/i.test(p)) return path.join(home, 'Desktop');
+        if (/^documents$/i.test(p)) return path.join(home, 'Documents');
+        if (/^downloads$/i.test(p)) return path.join(home, 'Downloads');
+        if (/^pictures$/i.test(p)) return path.join(home, 'Pictures');
+        if (/^videos$/i.test(p)) return path.join(home, 'Videos');
+        if (/^music$/i.test(p)) return path.join(home, 'Music');
+        return p;
+    }
+
+    // Resolve all path-like parameters in an action's params object
+    resolveAllPaths(params) {
+        const pathKeys = [
+            'file_path', 'filepath', 'folder_path', 'path', 'save_path',
+            'source', 'destination', 'old_path', 'new_location',
+            'image_path', 'location', 'search_location',
+        ];
+        const resolved = { ...params };
+        for (const key of pathKeys) {
+            if (resolved[key] && typeof resolved[key] === 'string') {
+                resolved[key] = this.resolveFilePath(resolved[key]);
+            }
+        }
+        return resolved;
+    }
+
+    // ============================================
     // Execute Action by Name (WITH SAFETY CHECK)
     // ============================================
 
     async execute(actionName, params = {}) {
+        // Resolve all file paths (fix USERNAME, ~, Desktop etc.)
+        params = this.resolveAllPaths(params);
+
         // 🛡️ SAFETY CHECK FIRST
         const safetyCheck = safetyGuard.validateAction(actionName, params);
         
@@ -1579,6 +1675,9 @@ class ActionExecutor {
             'click': () => this.click(params.x, params.y, params.click_type, params.double),
             'scroll': () => this.scroll(params.direction, params.amount),
             'drag': () => this.drag(params.start_x, params.start_y, params.end_x, params.end_y),
+
+            // Vision Agent — execute a single vision-determined action (coordinates)
+            'vision_execute': () => screenAgent.executeVisionAction(params),
             
             // Keyboard control
             'type_text': () => this.typeText(params.text, params.delay),
@@ -1614,6 +1713,7 @@ class ActionExecutor {
             'powerpoint_add_title': () => this.pptAddTitle(params.title || params.text),
             'powerpoint_add_content': () => this.pptAddContent(params.content || params.text),
             'create_presentation': () => this.createPresentation(params.title, params.save_path, params.slides_content),
+            'generate_ppt': () => this.generatePPT(params),
 
             // PowerPoint COM automation (themes, animations, layouts)
             'ppt_apply_theme': () => this.ppt_apply_theme(params.theme_name),
@@ -1660,6 +1760,7 @@ class ActionExecutor {
             'onenote_open': () => onenoteCOM.openOneNote(),
             'onenote_create_page': () => onenoteCOM.createPage(params.title, params.section),
             'onenote_add_content': () => onenoteCOM.addContent(params.content),
+            'onenote_list_notebooks': () => onenoteCOM.listNotebooks(),
             
             // Publisher COM automation
             'publisher_create': () => publisherCOM.createPublication(params.template_type),

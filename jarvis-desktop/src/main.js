@@ -8,10 +8,12 @@ const actionExecutor = require('./modules/action-executor');
 // Initialize store for settings
 const store = new Store({
     defaults: {
-        colabUrl: 'http://localhost:8001',
+        colabUrl: 'http://localhost:8000',
+        cogagentUrl: '',
         screenshotInterval: 1000, // ms
         screenshotQuality: 80,
         autoScreenshot: true,
+        alwaysOnTop: true,
         hotkey: 'CommandOrControl+Shift+J'
     }
 });
@@ -31,7 +33,8 @@ function createWindow() {
         x: width - 470,
         y: height - 720,
         frame: false,
-        transparent: true,
+        transparent: false,
+        backgroundColor: '#0a0a0f',
         alwaysOnTop: true,
         resizable: true,
         skipTaskbar: false,
@@ -133,32 +136,61 @@ async function takeScreenshot() {
     try {
         isCapturing = true;
         
-        // Capture screenshot
-        const imgBuffer = await screenshot({ format: 'png' });
+        // Capture screenshot — try PNG first, fall back to JPG
+        let imgBuffer;
+        try {
+            imgBuffer = await screenshot({ format: 'png' });
+        } catch {
+            imgBuffer = await screenshot({ format: 'jpg' });
+        }
+        
+        if (!imgBuffer || imgBuffer.length < 100) {
+            isCapturing = false;
+            return null;
+        }
         
         // Get screen dimensions
         const { width, height } = screen.getPrimaryDisplay().size;
-        
-        // Resize and compress for faster transfer
         const quality = store.get('screenshotQuality');
-        const resizedBuffer = await sharp(imgBuffer)
-            .resize(Math.floor(width / 2), Math.floor(height / 2)) // Half resolution
-            .jpeg({ quality: quality })
-            .toBuffer();
-        
-        const base64 = resizedBuffer.toString('base64');
+
+        // Use sharp with failOn:'none' — tolerates slightly corrupt input
+        let resizedBuffer;
+        try {
+            resizedBuffer = await sharp(imgBuffer, { failOn: 'none' })
+                .resize(Math.floor(width / 2), Math.floor(height / 2))
+                .jpeg({ quality })
+                .toBuffer();
+        } catch {
+            // If PNG decoding fails, try re-capturing as JPEG directly
+            try {
+                imgBuffer = await screenshot({ format: 'jpg' });
+                resizedBuffer = await sharp(imgBuffer, { failOn: 'none' })
+                    .resize(Math.floor(width / 2), Math.floor(height / 2))
+                    .jpeg({ quality })
+                    .toBuffer();
+            } catch (e2) {
+                isCapturing = false;
+                if (!takeScreenshot._lastErr || Date.now() - takeScreenshot._lastErr > 60000) {
+                    console.error('Screenshot error:', e2.message);
+                    takeScreenshot._lastErr = Date.now();
+                }
+                return null;
+            }
+        }
         
         isCapturing = false;
-        
         return {
-            screenshot: base64,
-            width: width,
-            height: height,
+            screenshot: resizedBuffer.toString('base64'),
+            width,
+            height,
             timestamp: Date.now()
         };
     } catch (error) {
         isCapturing = false;
-        console.error('Screenshot error:', error);
+        if (!takeScreenshot._lastErr || Date.now() - takeScreenshot._lastErr > 60000) {
+            console.error('Screenshot error:', error.message);
+            takeScreenshot._lastErr = Date.now();
+        }
         return null;
     }
 }
@@ -250,9 +282,11 @@ app.on('will-quit', () => {
 ipcMain.handle('get-settings', () => {
     return {
         colabUrl: store.get('colabUrl'),
+        cogagentUrl: store.get('cogagentUrl'),
         screenshotInterval: store.get('screenshotInterval'),
         screenshotQuality: store.get('screenshotQuality'),
         autoScreenshot: store.get('autoScreenshot'),
+        alwaysOnTop: store.get('alwaysOnTop'),
         hotkey: store.get('hotkey')
     };
 });
@@ -270,6 +304,11 @@ ipcMain.handle('save-settings', (event, settings) => {
             stopScreenshotCapture();
         }
     }
+    if (settings.cogagentUrl !== undefined) store.set('cogagentUrl', settings.cogagentUrl);
+    if (settings.alwaysOnTop !== undefined) {
+        store.set('alwaysOnTop', settings.alwaysOnTop);
+        if (mainWindow) mainWindow.setAlwaysOnTop(settings.alwaysOnTop);
+    }
     if (settings.hotkey !== undefined) {
         store.set('hotkey', settings.hotkey);
         registerHotkey();
@@ -282,6 +321,38 @@ ipcMain.handle('take-screenshot', async () => {
     return await takeScreenshot();
 });
 
+// Take HIGH-RES screenshot for vision agent (no downscaling — Gemini needs accuracy)
+ipcMain.handle('take-screenshot-hires', async () => {
+    try {
+        let imgBuffer;
+        try { imgBuffer = await screenshot({ format: 'png' }); }
+        catch { imgBuffer = await screenshot({ format: 'jpg' }); }
+        if (!imgBuffer || imgBuffer.length < 100) return null;
+
+        const display = screen.getPrimaryDisplay();
+        const { width, height } = display.size;
+        const scale = display.scaleFactor || 1;
+
+        // Resize to FULL logical resolution (not half) — much better for coordinate accuracy
+        // Physical capture may be width*scale, so we resize to exactly width×height logical pixels
+        const resized = await sharp(imgBuffer, { failOn: 'none' })
+            .resize(width, height)
+            .jpeg({ quality: 85 })
+            .toBuffer();
+
+        return {
+            screenshot: resized.toString('base64'),
+            width,       // logical screen width
+            height,      // logical screen height
+            scaleFactor: scale,
+            timestamp: Date.now()
+        };
+    } catch (e) {
+        console.error('HiRes screenshot error:', e.message);
+        return null;
+    }
+});
+
 // Get screen info
 ipcMain.handle('get-screen-info', () => {
     const primaryDisplay = screen.getPrimaryDisplay();
@@ -290,6 +361,10 @@ ipcMain.handle('get-screen-info', () => {
         height: primaryDisplay.size.height,
         scaleFactor: primaryDisplay.scaleFactor
     };
+});
+
+ipcMain.handle('get-user-home', () => {
+    return require('os').homedir();
 });
 
 // Window controls
@@ -350,5 +425,53 @@ ipcMain.handle('check-stop-flag', async () => {
         return actionExecutor.isStopped();
     } catch (error) {
         return false;
+    }
+});
+
+// ============== COGAGENT DIRECT CONNECTION ==============
+// Bypasses the langchain backend for vision tasks — calls CogAgent Kaggle directly
+// from the main process (avoids CORS issues, custom timeout for ~31s inference)
+
+const axios = require('axios');
+
+// Check CogAgent health
+ipcMain.handle('cogagent-health', async () => {
+    const url = store.get('cogagentUrl');
+    if (!url) return { ok: false, error: 'No CogAgent URL configured' };
+    try {
+        const resp = await axios.get(`${url.replace(/\/+$/, '')}/health`, { timeout: 10000 });
+        return { ok: true, data: resp.data };
+    } catch (error) {
+        return { ok: false, error: error.message };
+    }
+});
+
+// Direct vision action — POST screenshot+goal to CogAgent and return the action
+ipcMain.handle('cogagent-vision-act', async (event, payload) => {
+    const url = store.get('cogagentUrl');
+    if (!url) return { action: 'fail', description: 'No CogAgent URL configured. Set it in Settings.' };
+    try {
+        const resp = await axios.post(`${url.replace(/\/+$/, '')}/vision_act`, {
+            screenshot:    payload.screenshot,
+            goal:          payload.goal,
+            step_history:  payload.step_history || [],
+            screen_width:  payload.screen_width || 1920,
+            screen_height: payload.screen_height || 1080,
+        }, {
+            timeout: 120000,                          // 120s — CogAgent inference takes ~31s
+            maxContentLength: 50 * 1024 * 1024,       // 50 MB (screenshots are large)
+            maxBodyLength:    50 * 1024 * 1024,
+            headers: { 'Content-Type': 'application/json' },
+        });
+        const result = resp.data;
+        result.action      = result.action      || 'fail';
+        result.description = result.description || '';
+        return result;
+    } catch (error) {
+        const msg = error.response
+            ? `CogAgent HTTP ${error.response.status}: ${JSON.stringify(error.response.data).slice(0, 200)}`
+            : `CogAgent unreachable: ${error.message}`;
+        console.error('[cogagent-vision-act]', msg);
+        return { action: 'fail', description: msg };
     }
 });

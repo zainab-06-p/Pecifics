@@ -237,18 +237,52 @@ try {
      * Toggle Night Light mode
      * @param {boolean} enable - true to enable, false to disable
      * @returns {Promise<Object>} Result
+     * Uses registry binary blob approach that works on Win10/11
      */
     async toggleNightLight(enable) {
         return new Promise((resolve) => {
-            const value = enable ? 1 : 0;
-            const psScript = `New-ItemProperty -Path "HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\CloudStore\\Store\\DefaultAccount\\Current\\default$windows.data.bluelightreduction.bluelightreductionstate\\windows.data.bluelightreduction.bluelightreductionstate" -Name "Data" -Value ${value} -PropertyType DWord -Force; @{success=$true; enabled=${enable}; message="Night Light ${enable ? 'enabled' : 'disabled'}"} | ConvertTo-Json`;
+            // Win10/11: Night Light state is stored as a binary blob in CloudStore.
+            // The most reliable way is to use the Settings URI + SendKeys, OR
+            // toggle via the quick-settings panel programmatically.
+            // We use a hybrid: try registry first, fall back to ms-settings URI.
+            const psScript = `
+try {
+    $regPath = 'HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\CloudStore\\Store\\DefaultAccount\\Current\\default' + [char]0x24 + 'windows.data.bluelightreduction.bluelightreductionstate\\windows.data.bluelightreduction.bluelightreductionstate'
+    if (Test-Path $regPath) {
+        $data = (Get-ItemProperty -Path $regPath -Name Data -ErrorAction SilentlyContinue).Data
+        if ($data -and $data.Length -gt 18) {
+            # Byte 18 controls on/off: 0x15 = off → on, 0x13 = on → off
+            if (${enable ? '$true' : '$false'}) {
+                $data[18] = 0x15
+            } else {
+                $data[18] = 0x13
+            }
+            Set-ItemProperty -Path $regPath -Name Data -Value ([byte[]]$data) -Type Binary
+            Write-Output 'REGISTRY_OK'
+        } else {
+            Write-Output 'FALLBACK'
+        }
+    } else {
+        Write-Output 'FALLBACK'
+    }
+} catch {
+    Write-Output 'FALLBACK'
+}
+`.replace(/\n/g, ' ');
 
-            exec(`powershell -Command "${psScript}"`, (error, stdout) => {
-                try {
-                    const result = JSON.parse(stdout);
-                    resolve(result);
-                } catch (e) {
+            exec(`powershell -ExecutionPolicy Bypass -Command "${psScript}"`, { timeout: 5000 }, (error, stdout) => {
+                const output = (stdout || '').trim();
+                if (output === 'REGISTRY_OK') {
                     resolve({ success: true, enabled: enable, message: `Night Light ${enable ? 'enabled' : 'disabled'}` });
+                } else {
+                    // Fallback: open Night Light settings page
+                    exec('start ms-settings:nightlight', () => {
+                        resolve({ 
+                            success: true, 
+                            enabled: enable, 
+                            message: `Night Light settings opened. Please toggle manually — registry approach unavailable.` 
+                        });
+                    });
                 }
             });
         });

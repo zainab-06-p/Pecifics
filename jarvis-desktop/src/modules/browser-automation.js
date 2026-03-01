@@ -7,12 +7,21 @@
 const { exec, spawn } = require('child_process');
 const path = require('path');
 const os   = require('os');
+const fsSync = require('fs');
 
 let playwright = null;
 let chromium   = null;
 let browser    = null;
 let page       = null;
+let persistentCtx = null;  // persistent browser context (cookies/logins survive)
 let playwrightAvailable = false;
+
+// Persistent profile directory — logins & cookies survive across sessions
+const BROWSER_DATA_DIR = path.join(os.homedir(), '.jarvis-browser-data');
+
+// The user's real Chrome profile (has all logged-in accounts)
+const CHROME_USER_DATA = path.join(os.homedir(), 'AppData', 'Local', 'Google', 'Chrome', 'User Data');
+const CDP_PORT = 9223;  // port for Chrome DevTools Protocol
 
 // Try to load Playwright at startup
 (async () => {
@@ -52,40 +61,181 @@ function delay(ms) { return new Promise(r => setTimeout(r, ms)); }
 
 async function ensureBrowser(browserName = 'chromium') {
     if (!playwrightAvailable) throw new Error('Playwright not available');
-    if (!browser || !browser.isConnected()) {
-        const launchOpts = { headless: false, args: ['--start-maximized'] };
-        if (browserName === 'firefox') {
-            browser = await playwright.firefox.launch(launchOpts);
-        } else if (browserName === 'webkit' || browserName === 'safari') {
-            browser = await playwright.webkit.launch(launchOpts);
-        } else {
-            // chromium – try to use installed Chrome/Edge first
-            try {
-                const { executablePath } = require('playwright');
-                browser = await chromium.launch({
-                    ...launchOpts,
-                    channel: 'chrome',  // use installed Chrome
-                });
-            } catch {
-                browser = await chromium.launch(launchOpts);
+
+    // Already have a live session?
+    if (browser && page && !page.isClosed()) {
+        return { browser, page };
+    }
+
+    // Clean up stale session
+    if (browser) {
+        try { await browser.close(); } catch {}
+        browser = null; persistentCtx = null; page = null;
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    // STRATEGY: Launch the user's REAL Chrome with remote-debugging
+    // so Playwright can control it WITH all logged-in accounts.
+    // ═══════════════════════════════════════════════════════════════
+
+    // 1. Try connecting to an existing Chrome that's already in debug mode
+    try {
+        const cdpUrl = `http://127.0.0.1:${CDP_PORT}`;
+        browser = await chromium.connectOverCDP(cdpUrl);
+        const contexts = browser.contexts();
+        const ctx = contexts[0] || await browser.newContext({ viewport: null });
+        persistentCtx = ctx;
+        page = ctx.pages()[0] || await ctx.newPage();
+        console.log('✅ Connected to existing Chrome (all your accounts are available)');
+        return { browser, page };
+    } catch {
+        // No Chrome with debug port running — we'll launch one
+    }
+
+    // 2. Close any normal Chrome so we can relaunch it with debugging
+    //    (Chrome locks its profile, so we must close first)
+    try {
+        const { execSync } = require('child_process');
+        // Gracefully ask Chrome to close
+        execSync('taskkill /IM chrome.exe /F 2>NUL', { timeout: 5000, stdio: 'ignore' });
+        await delay(1500);
+    } catch {} // ignore if Chrome wasn't running
+
+    // 3. Launch Chrome with the REAL user profile + remote debugging
+    const chromePaths = [
+        'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe',
+        'C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe',
+        path.join(os.homedir(), 'AppData', 'Local', 'Google', 'Chrome', 'Application', 'chrome.exe'),
+    ];
+    let chromeExe = null;
+    for (const p of chromePaths) {
+        if (fsSync.existsSync(p)) { chromeExe = p; break; }
+    }
+
+    if (chromeExe && fsSync.existsSync(CHROME_USER_DATA)) {
+        try {
+            const { spawn: spawnProc } = require('child_process');
+            const chromeArgs = [
+                `--remote-debugging-port=${CDP_PORT}`,
+                `--user-data-dir=${CHROME_USER_DATA}`,
+                '--restore-last-session',
+                '--no-first-run',
+                '--no-default-browser-check',
+                '--start-maximized',
+            ];
+            const chromeProcess = spawnProc(chromeExe, chromeArgs, {
+                detached: true, stdio: 'ignore',
+            });
+            chromeProcess.unref();
+            console.log(`🚀 Launched Chrome with your profile on debug port ${CDP_PORT}`);
+
+            // Wait for Chrome to start accepting connections
+            for (let i = 0; i < 20; i++) {
+                await delay(800);
+                try {
+                    browser = await chromium.connectOverCDP(`http://127.0.0.1:${CDP_PORT}`);
+                    const contexts = browser.contexts();
+                    const ctx = contexts[0] || await browser.newContext({ viewport: null });
+                    persistentCtx = ctx;
+                    page = ctx.pages()[0] || await ctx.newPage();
+                    console.log('✅ Connected to YOUR Chrome (all logged-in accounts available)');
+                    return { browser, page };
+                } catch {
+                    // Chrome not ready yet, retry
+                }
             }
+        } catch (e) {
+            console.warn('Chrome CDP launch failed:', e.message);
         }
     }
-    if (!page || page.isClosed()) {
-        const ctx = await browser.newContext({ viewport: null }); // full screen
-        page = await ctx.newPage();
+
+    // ═══════════════════════════════════════════════════════════════
+    // FALLBACK: Use Playwright's bundled Chromium with persistent ctx
+    // (won't have your Google accounts, but at least works)
+    // ═══════════════════════════════════════════════════════════════
+    console.warn('⚠️ Falling back to Playwright Chromium (won\'t have your logged-in accounts)');
+
+    if (!fsSync.existsSync(BROWSER_DATA_DIR)) {
+        fsSync.mkdirSync(BROWSER_DATA_DIR, { recursive: true });
     }
-    return { browser, page };
+
+    const launchOpts = {
+        headless: false,
+        viewport: null,
+        args: [
+            '--start-maximized',
+            '--disable-blink-features=AutomationControlled',
+            '--no-first-run',
+            '--no-default-browser-check',
+        ],
+    };
+
+    try {
+        persistentCtx = await chromium.launchPersistentContext(BROWSER_DATA_DIR, {
+            ...launchOpts,
+            channel: 'chrome',
+        });
+        browser = persistentCtx;
+        page = persistentCtx.pages()[0] || await persistentCtx.newPage();
+        return { browser, page };
+    } catch {
+        persistentCtx = await chromium.launchPersistentContext(BROWSER_DATA_DIR, launchOpts);
+        browser = persistentCtx;
+        page = persistentCtx.pages()[0] || await persistentCtx.newPage();
+        return { browser, page };
+    }
 }
 
 async function getOrCreatePage() {
     if (!playwrightAvailable) return null;
     try {
+        if (page && !page.isClosed()) return page;
+        if (persistentCtx) {
+            const pages = persistentCtx.pages ? persistentCtx.pages() : [];
+            if (pages.length > 0) { page = pages[pages.length - 1]; return page; }
+            page = await persistentCtx.newPage();
+            return page;
+        }
         return (await ensureBrowser()).page;
     } catch (e) {
         console.error('Browser session error:', e.message);
         return null;
     }
+}
+
+/**
+ * Find an existing browser tab whose URL contains the given substring.
+ * Returns the page if found, or null.
+ */
+function findTabByUrl(urlSubstring) {
+    if (!persistentCtx) return null;
+    const pages = persistentCtx.pages ? persistentCtx.pages() : [];
+    for (const p of pages) {
+        try {
+            if (p.url().includes(urlSubstring)) return p;
+        } catch {}
+    }
+    return null;
+}
+
+/**
+ * Get an existing tab matching urlSubstring, or navigate the current page.
+ * Avoids opening new tabs when one already exists.
+ */
+async function getOrNavigateTo(urlSubstring, fullUrl) {
+    // First check if an existing tab already has this site open
+    const existing = findTabByUrl(urlSubstring);
+    if (existing) {
+        page = existing;
+        await existing.bringToFront().catch(() => {});
+        return existing;
+    }
+    // Otherwise navigate the current page (no new tab)
+    const p = await getOrCreatePage();
+    if (p) {
+        await p.goto(fullUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
+    }
+    return p;
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -101,8 +251,10 @@ class BrowserAutomation {
     async open(url, browserName = 'chrome') {
         if (playwrightAvailable) {
             try {
-                const { page: p } = await ensureBrowser(browserName);
-                await p.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
+                await ensureBrowser(browserName);
+                // Try to reuse an existing tab for this domain
+                const domain = new URL(url.startsWith('http') ? url : 'https://' + url).hostname;
+                const p = await getOrNavigateTo(domain, url);
                 const title = await p.title();
                 return { success: true, message: `Opened: ${url}`, title };
             } catch (e) {
@@ -122,15 +274,17 @@ class BrowserAutomation {
      */
     async navigate(url) {
         if (!url.startsWith('http')) url = 'https://' + url;
-        const p = await getOrCreatePage();
-        if (p) {
-            try {
-                await p.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
+        try {
+            await ensureBrowser();
+            // Reuse existing tab for same domain or navigate current tab
+            const domain = new URL(url).hostname;
+            const p = await getOrNavigateTo(domain, url);
+            if (p) {
                 const title = await p.title();
                 return { success: true, message: `Navigated to: ${url}`, title };
-            } catch (e) {
-                return { success: false, error: e.message };
             }
+        } catch (e) {
+            return { success: false, error: e.message };
         }
         // Fallback
         return this.open(url);
@@ -811,9 +965,9 @@ class BrowserAutomation {
      * Open a new tab.
      */
     async newTab(url = '') {
-        if (!browser || !browser.isConnected()) return { success: false, error: 'Browser not open' };
+        const ctx = persistentCtx || (browser && browser.contexts && browser.contexts()[0]);
+        if (!ctx) return { success: false, error: 'Browser not open' };
         try {
-            const ctx = browser.contexts()[0];
             const newPage = await ctx.newPage();
             if (url) await newPage.goto(url, { waitUntil: 'domcontentloaded' });
             page = newPage;
@@ -828,9 +982,19 @@ class BrowserAutomation {
      */
     async close() {
         try {
-            if (browser) { await browser.close(); browser = null; page = null; }
-            return { success: true, message: 'Browser closed' };
+            // For CDP connections, just disconnect — don't close the user's Chrome
+            if (browser && typeof browser.isConnected === 'function' && browser.isConnected()) {
+                browser.close();  // disconnect CDP (does NOT close Chrome)
+            } else if (persistentCtx) {
+                await persistentCtx.close();
+                persistentCtx = null;
+            } else if (browser) {
+                await browser.close();
+            }
+            browser = null; persistentCtx = null; page = null;
+            return { success: true, message: 'Browser disconnected' };
         } catch (e) {
+            browser = null; persistentCtx = null; page = null;
             return { success: false, error: e.message };
         }
     }
@@ -887,14 +1051,25 @@ class BrowserAutomation {
      */
     async openGmailAccount(email) {
         try {
+            await ensureBrowser();
             const idx = email ? await this.resolveGmailIndex(email) : 0;
+            const gmailUrl = idx >= 0
+                ? `https://mail.google.com/mail/u/${idx}/`
+                : 'https://mail.google.com';
+
+            // Reuse an existing Gmail tab if available
+            const p = await getOrNavigateTo('mail.google.com', gmailUrl);
+            if (!p) return { success: false, error: 'Browser not open.' };
+
+            // If the current Gmail tab is for a different account slot, navigate
+            if (idx >= 0 && !p.url().includes(`/u/${idx}/`)) {
+                await p.goto(gmailUrl, { waitUntil: 'domcontentloaded', timeout: 20000 });
+            }
+
             if (idx >= 0) {
-                const { page: p } = await ensureBrowser();
-                await p.goto(`https://mail.google.com/mail/u/${idx}/`, { waitUntil: 'domcontentloaded', timeout: 20000 });
                 return { success: true, message: `Opened Gmail for ${email} (account slot ${idx})`, accountIndex: idx };
             }
-            // Account not found — navigate to account chooser so user can sign in or pick
-            const { page: p } = await ensureBrowser();
+            // Account not found — navigate to account chooser
             const chooserUrl = email
                 ? `https://accounts.google.com/AccountChooser?Email=${encodeURIComponent(email)}&continue=https://mail.google.com`
                 : 'https://mail.google.com';
@@ -909,77 +1084,186 @@ class BrowserAutomation {
         }
     }
 
+    /** Helper: try multiple selectors to fill a field */
+    async _fillField(p, selectors, value) {
+        for (const sel of selectors) {
+            try {
+                await p.waitForSelector(sel, { timeout: 3000, state: 'visible' });
+                await p.fill(sel, value);
+                return true;
+            } catch {}
+        }
+        return false;
+    }
+
     /**
      * Send an email via Gmail web interface (Playwright).
-     * If accountEmail is given, switches to that Gmail account first.
+     * Uses keyboard shortcuts for maximum reliability.
      */
     async sendGmail(to, subject, body, accountEmail = '') {
-        const p = await getOrCreatePage();
-        if (!p) return { success: false, error: 'Browser not open. Open Gmail first.' };
+        await ensureBrowser();
 
         try {
-            // Switch to correct Gmail account slot if specified
+            // ── 1. Find or navigate to Gmail (reuse existing tab) ──
             let gmailUrl = 'https://mail.google.com';
             if (accountEmail) {
                 const idx = await this.resolveGmailIndex(accountEmail);
                 if (idx >= 0) gmailUrl = `https://mail.google.com/mail/u/${idx}/`;
             }
-            // Make sure Gmail is open
-            const url = p.url();
-            if (!url.includes('mail.google.com')) {
-                await p.goto(gmailUrl, { waitUntil: 'domcontentloaded', timeout: 20000 });
-                await delay(2000);
-            } else if (accountEmail && !url.includes(`/u/${await this.resolveGmailIndex(accountEmail)}/`)) {
-                // Wrong account slot — switch
-                await p.goto(gmailUrl, { waitUntil: 'domcontentloaded', timeout: 20000 });
-                await delay(2000);
+
+            // Reuse an existing Gmail tab if one is already open
+            const p = await getOrNavigateTo('mail.google.com', gmailUrl);
+            if (!p) return { success: false, error: 'Browser not open.' };
+
+            // ── 2. Wait for Gmail to ACTUALLY load (inbox or compose visible) ──
+            const gmailReady = async () => {
+                // Give Gmail generous time to fully load
+                for (let attempt = 0; attempt < 15; attempt++) {
+                    const ready = await p.evaluate(() => {
+                        // Gmail is loaded when we see the compose button OR the inbox
+                        return !!document.querySelector('div[gh="cm"]') ||
+                               !!document.querySelector('[data-tooltip="Compose"]') ||
+                               !!document.querySelector('div.T-I.T-I-KE.L3') ||
+                               !!document.querySelector('div[role="navigation"]') ||
+                               !!document.querySelector('table[role="grid"]') ||
+                               !!document.querySelector('.aim');
+                    }).catch(() => false);
+                    if (ready) return true;
+                    await delay(1500);
+                }
+                return false;
+            };
+            const loaded = await gmailReady();
+            if (!loaded) {
+                // Fallback: try compose URL directly
+                await p.goto(gmailUrl + '#compose', { waitUntil: 'domcontentloaded', timeout: 20000 });
+                await delay(4000);
             }
 
-            // Click Compose
-            const composeSelectors = [
-                '[gh="cm"]',
-                '.T-I.T-I-KE.L3',
-                'div[class*="compose"]',
-                'button:has-text("Compose")',
-            ];
+            // Handle any cookie banners / consent dialogs
+            await this.autoHandleBlockers();
+            await delay(500);
+
+            // ── 3. Open Compose (multiple strategies) ──
             let composed = false;
-            for (const sel of composeSelectors) {
-                try { await p.click(sel, { timeout: 3000 }); composed = true; break; } catch {}
+
+            // Strategy A: Direct compose URL (most reliable — no need for keyboard shortcuts)
+            if (!composed) {
+                try {
+                    const composeCheck = await p.evaluate(() => {
+                        return !!document.querySelector('input[name="to"]') ||
+                               !!document.querySelector('[aria-label="To recipients"]') ||
+                               !!document.querySelector('div[aria-label="New Message"]');
+                    });
+                    if (composeCheck) composed = true;
+                } catch {}
             }
-            if (!composed) return { success: false, error: 'Could not find Compose button' };
-            await delay(1000);
 
-            // To field
-            await p.fill('input[name="to"]', to, { timeout: 5000 }).catch(() => {});
+            if (!composed) {
+                try {
+                    const currentUrl = p.url();
+                    if (!currentUrl.includes('#compose')) {
+                        // Navigate to compose via URL hash
+                        const baseUrl = currentUrl.split('#')[0];
+                        await p.goto(baseUrl + '#compose', { waitUntil: 'domcontentloaded', timeout: 15000 });
+                        await delay(3000);
+                        const check = await p.evaluate(() => {
+                            return !!document.querySelector('input[name="to"]') ||
+                                   !!document.querySelector('[aria-label="To recipients"]');
+                        }).catch(() => false);
+                        if (check) composed = true;
+                    }
+                } catch {}
+            }
+
+            // Strategy B: Click the Compose button
+            if (!composed) {
+                const composeSelectors = [
+                    'div[gh="cm"]',
+                    '.T-I.T-I-KE.L3',
+                    '[data-tooltip="Compose"]',
+                    '[aria-label="Compose"]',
+                ];
+                for (const sel of composeSelectors) {
+                    try { await p.click(sel, { timeout: 3000 }); await delay(2000); composed = true; break; } catch {}
+                }
+            }
+
+            // Strategy C: JS — click any element whose text says "Compose"
+            if (!composed) {
+                composed = await p.evaluate(() => {
+                    const els = document.querySelectorAll('div[role="button"], button, a, span');
+                    for (const el of els) {
+                        if ((el.textContent || '').trim() === 'Compose') { el.click(); return true; }
+                    }
+                    return false;
+                }).catch(() => false);
+                if (composed) await delay(2000);
+            }
+
+            // Strategy D: Keyboard shortcut 'c' (needs Gmail shortcuts enabled)
+            if (!composed) {
+                try {
+                    await p.click('body', { timeout: 2000 }).catch(() => {});
+                    await delay(300);
+                    await p.keyboard.press('c');
+                    await delay(2500);
+                    composed = await p.evaluate(() => {
+                        return !!document.querySelector('input[name="to"]') ||
+                               !!document.querySelector('[aria-label="To recipients"]');
+                    }).catch(() => false);
+                } catch {}
+            }
+
+            if (!composed) return { success: false, error: 'Could not open Compose. Make sure Gmail is fully loaded and you are logged in.' };
+            await delay(1500);
+
+            // ── 4. Fill To field ──
+            const toFilled = await this._fillField(p, [
+                'input[name="to"]',
+                'input[aria-label="To recipients"]',
+                'input[aria-label="To"]',
+                'textarea[name="to"]',
+            ], to);
+            if (!toFilled) return { success: false, error: 'Could not fill To field' };
             await p.keyboard.press('Tab');
-            await delay(300);
+            await delay(500);
 
-            // Subject field
-            await p.fill('input[name="subjectbox"]', subject, { timeout: 5000 }).catch(() => {});
-            await delay(300);
+            // ── 5. Fill Subject field ──
+            await this._fillField(p, [
+                'input[name="subjectbox"]',
+                'input[aria-label="Subject"]',
+                'input[placeholder="Subject"]',
+            ], subject);
+            await delay(500);
 
-            // Body – click in compose area
+            // ── 6. Fill Body ──
             const bodySelectors = [
                 'div[aria-label="Message Body"]',
+                'div[aria-label*="Message Body"]',
                 'div.Am.Al.editable.LW-avf',
-                'div[contenteditable="true"]',
+                'div[role="textbox"][aria-label*="body" i]',
+                'div[contenteditable="true"][aria-label]',
             ];
+            let bodyFilled = false;
             for (const sel of bodySelectors) {
-                try { await p.click(sel, { timeout: 3000 }); break; } catch {}
+                try {
+                    await p.click(sel, { timeout: 3000 });
+                    await p.keyboard.type(body, { delay: 10 });
+                    bodyFilled = true;
+                    break;
+                } catch {}
             }
-            await p.keyboard.type(body);
-            await delay(300);
-
-            // Send button
-            const sendSelectors = [
-                'div[aria-label="Send ‪(Ctrl-Enter)‬"]',
-                'div[data-tooltip="Send"]',
-                '.T-I.J-J5-Ji.aoO.T-I-atl.L3',
-            ];
-            for (const sel of sendSelectors) {
-                try { await p.click(sel, { timeout: 3000 }); break; } catch {}
+            if (!bodyFilled) {
+                // Fallback: Tab into body area and type
+                await p.keyboard.press('Tab');
+                await delay(300);
+                await p.keyboard.type(body, { delay: 10 });
             }
+            await delay(500);
 
+            // ── 7. Send via Ctrl+Enter ──
+            await p.keyboard.press('Control+Enter');
             await delay(2000);
             return { success: true, message: `Email sent to ${to}: "${subject}"` };
         } catch (e) {

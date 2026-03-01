@@ -51,34 +51,57 @@ class OneNoteCOM {
      * Create a new page with title
      */
     async createPage(title, sectionName = null) {
+        // Use GetHierarchy to find the current notebook's first section,
+        // then create a page in it.
+        const escapedTitle = (title || 'New Page').replace(/"/g, '`"').replace(/'/g, "''");
         const script = `
             $onenote = New-Object -ComObject OneNote.Application
             
-            # Get current section
-            [ref]$currentSectionId = ""
-            $onenote.GetCurrentPage([ref]$currentSectionId)
+            # Get hierarchy XML to find first section
+            [ref]$hierarchyXml = ""
+            $onenote.GetHierarchy("", [Microsoft.Office.Interop.OneNote.HierarchyScope]::hsSections, [ref]$hierarchyXml)
+            
+            $xml = [xml]$hierarchyXml.Value
+            $ns = New-Object System.Xml.XmlNamespaceManager($xml.NameTable)
+            $ns.AddNamespace("one", $xml.DocumentElement.NamespaceURI)
+            
+            # Find first section
+            $section = $xml.SelectSingleNode("//one:Section", $ns)
+            if (-not $section) {
+                Write-Output "ERROR:No section found in OneNote"
+                return
+            }
+            $sectionId = $section.GetAttribute("ID")
             
             # Create new page
             [ref]$newPageId = ""
-            $onenote.CreateNewPage($currentSectionId.Value, [ref]$newPageId)
+            $onenote.CreateNewPage($sectionId, [ref]$newPageId)
             
-            # Get page content
+            # Get the new page's XML
             [ref]$pageXml = ""
             $onenote.GetPageContent($newPageId.Value, [ref]$pageXml)
             
-            # Update title
-            $xml = [xml]$pageXml.Value
-            $xml.Page.Title.OE.T = "${title}"
+            # Set title
+            $pageDoc = [xml]$pageXml.Value
+            $nsPage = New-Object System.Xml.XmlNamespaceManager($pageDoc.NameTable)
+            $nsPage.AddNamespace("one", $pageDoc.DocumentElement.NamespaceURI)
+            $titleNode = $pageDoc.SelectSingleNode("//one:Title/one:OE/one:T", $nsPage)
+            if ($titleNode) {
+                $titleNode.InnerText = '${escapedTitle}'
+            }
+            $onenote.UpdatePageContent($pageDoc.OuterXml)
             
-            # Update page
-            $onenote.UpdatePageContent($xml.OuterXml)
-            
-            Write-Output "Page created with title: ${title}"
+            # Navigate to the new page
+            $onenote.NavigateTo($newPageId.Value)
+            Write-Output "Page created: ${escapedTitle}"
         `;
         
         try {
-            await this.executePowerShell(script);
-            return { success: true, message: `Page '${title}' created` };
+            const result = await this.executePowerShell(script);
+            if (result.startsWith('ERROR:')) {
+                return { success: false, error: result.substring(6) };
+            }
+            return { success: true, message: `Page '${title}' created in OneNote` };
         } catch (error) {
             return { success: false, error: error.message };
         }
@@ -88,42 +111,63 @@ class OneNoteCOM {
      * Add content to current page
      */
     async addContent(content) {
+        const escapedContent = (content || '').replace(/"/g, '`"').replace(/'/g, "''").replace(/\n/g, '<br/>');
         const script = `
             $onenote = New-Object -ComObject OneNote.Application
             
-            # Get current page
-            [ref]$pageId = ""
-            $onenote.GetCurrentPage([ref]$pageId)
-            
-            # Get page content
+            # Get the current page ID
+            [ref]$currentPageId = ""
             [ref]$pageXml = ""
-            $onenote.GetPageContent($pageId.Value, [ref]$pageXml)
+            $onenote.GetHierarchy("", [Microsoft.Office.Interop.OneNote.HierarchyScope]::hsPages, [ref]$pageXml)
             
-            # Add content (simplified - adds text outline)
+            # Get the currently active page
             $xml = [xml]$pageXml.Value
             $ns = New-Object System.Xml.XmlNamespaceManager($xml.NameTable)
             $ns.AddNamespace("one", $xml.DocumentElement.NamespaceURI)
+            $activePage = $xml.SelectSingleNode("//one:Page[@isCurrentlyViewed='true']", $ns)
             
-            # Create new outline
-            $outline = $xml.CreateElement("one", "Outline", $xml.DocumentElement.NamespaceURI)
-            $oeChildren = $xml.CreateElement("one", "OEChildren", $xml.DocumentElement.NamespaceURI)
-            $oe = $xml.CreateElement("one", "OE", $xml.DocumentElement.NamespaceURI)
-            $t = $xml.CreateElement("one", "T", $xml.DocumentElement.NamespaceURI)
-            $t.InnerText = "${content}"
+            if (-not $activePage) {
+                # Fall back to first page
+                $activePage = $xml.SelectSingleNode("//one:Page", $ns)
+            }
             
+            if (-not $activePage) {
+                Write-Output "ERROR:No page found"
+                return
+            }
+            
+            $pageId = $activePage.GetAttribute("ID")
+            
+            # Get full page content
+            [ref]$fullPageXml = ""
+            $onenote.GetPageContent($pageId, [ref]$fullPageXml)
+            $pageDoc = [xml]$fullPageXml.Value
+            $nsP = New-Object System.Xml.XmlNamespaceManager($pageDoc.NameTable)
+            $nsP.AddNamespace("one", $pageDoc.DocumentElement.NamespaceURI)
+            
+            # Create new outline with the content
+            $oneNs = $pageDoc.DocumentElement.NamespaceURI
+            $outline = $pageDoc.CreateElement("one", "Outline", $oneNs)
+            $oeChildren = $pageDoc.CreateElement("one", "OEChildren", $oneNs)
+            $oe = $pageDoc.CreateElement("one", "OE", $oneNs)
+            $t = $pageDoc.CreateElement("one", "T", $oneNs)
+            $cdata = $pageDoc.CreateCDataSection('${escapedContent}')
+            $t.AppendChild($cdata)
             $oe.AppendChild($t)
             $oeChildren.AppendChild($oe)
             $outline.AppendChild($oeChildren)
-            $xml.DocumentElement.AppendChild($outline)
+            $pageDoc.DocumentElement.AppendChild($outline)
             
             # Update page
-            $onenote.UpdatePageContent($xml.OuterXml)
-            
+            $onenote.UpdatePageContent($pageDoc.OuterXml)
             Write-Output "Content added"
         `;
         
         try {
-            await this.executePowerShell(script);
+            const result = await this.executePowerShell(script);
+            if (result.startsWith('ERROR:')) {
+                return { success: false, error: result.substring(6) };
+            }
             return { success: true, message: 'Content added to OneNote' };
         } catch (error) {
             return { success: false, error: error.message };
@@ -148,6 +192,37 @@ class OneNoteCOM {
             return result === 'true';
         } catch {
             return false;
+        }
+    }
+
+    /**
+     * List all notebooks and their sections
+     */
+    async listNotebooks() {
+        const script = `
+            $onenote = New-Object -ComObject OneNote.Application
+            [ref]$xml = ""
+            $onenote.GetHierarchy("", [Microsoft.Office.Interop.OneNote.HierarchyScope]::hsSections, [ref]$xml)
+            $doc = [xml]$xml.Value
+            $ns = New-Object System.Xml.XmlNamespaceManager($doc.NameTable)
+            $ns.AddNamespace("one", $doc.DocumentElement.NamespaceURI)
+            $results = @()
+            foreach ($nb in $doc.SelectNodes("//one:Notebook", $ns)) {
+                $sections = @()
+                foreach ($sec in $nb.SelectNodes("one:Section", $ns)) {
+                    $sections += $sec.GetAttribute("name")
+                }
+                $results += [PSCustomObject]@{ name = $nb.GetAttribute("name"); sections = ($sections -join ", ") }
+            }
+            $results | ConvertTo-Json -Compress
+        `;
+        try {
+            const result = await this.executePowerShell(script);
+            let notebooks = JSON.parse(result);
+            if (!Array.isArray(notebooks)) notebooks = [notebooks];
+            return { success: true, notebooks, message: `Found ${notebooks.length} notebook(s)` };
+        } catch (error) {
+            return { success: false, error: error.message };
         }
     }
 }

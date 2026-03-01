@@ -8,6 +8,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
     
     // Screenshot
     takeScreenshot: () => ipcRenderer.invoke('take-screenshot'),
+    takeScreenshotHires: () => ipcRenderer.invoke('take-screenshot-hires'),
     onScreenshotCaptured: (callback) => {
         ipcRenderer.on('screenshot-captured', (event, data) => callback(data));
     },
@@ -32,6 +33,13 @@ contextBridge.exposeInMainWorld('electronAPI', {
     resetStopFlag: () => ipcRenderer.invoke('reset-stop-flag'),
     checkStopFlag: () => ipcRenderer.invoke('check-stop-flag'),
     
+    // User home directory
+    getUserHome: () => ipcRenderer.invoke('get-user-home'),
+
+    // CogAgent direct connection (bypasses langchain backend for vision)
+    cogagentHealth:    ()        => ipcRenderer.invoke('cogagent-health'),
+    cogagentVisionAct: (payload) => ipcRenderer.invoke('cogagent-vision-act', payload),
+
     // Events
     onShowSettings: (callback) => {
         ipcRenderer.on('show-settings', () => callback());

@@ -1,39 +1,17 @@
 """
-Pecifics AI Desktop Assistant - LangChain Backend
+Pecifics AI Desktop Assistant — LangGraph Backend
 =====================================================
-No GPU required. Runs on free cloud APIs.
-
-Supported LLM providers (set LLM_PROVIDER env var):
-  groq         - Groq cloud FREE tier (llama-3.3-70b)         ← DEFAULT ★
-  ollama       - Local Ollama (llama3, mistral, qwen, phi3)
-  huggingface  - HuggingFace Inference API free tier
-  transformers - Direct local HF model (GPU, works on Kaggle/Colab)
-  openai       - OpenAI GPT-4o (paid, optional)
-
-Vision provider (set VISION_PROVIDER env var):
-  gemini       - Google Gemini 2.0 Flash (free tier)          ← DEFAULT ★
-  openai       - GPT-4o vision (paid)
-  ollama       - Local llava/moondream
-  transformers - Qwen2-VL on GPU
-
-Quick start (recommended — no GPU, no ngrok, fully free):
-  # 1. Get free Groq key → https://console.groq.com
-  # 2. Get free Gemini key → https://aistudio.google.com/app/apikey
-  set GROQ_API_KEY=your_groq_key
-  set GEMINI_API_KEY=your_gemini_key
-  python langchain_backend.py --port 8000
-
-  # Option B — Ollama (fully local)
-  ollama pull llama3
-  set LLM_PROVIDER=ollama
-  set VISION_PROVIDER=ollama
-  python langchain_backend.py --port 8000
-
-  # Option C — Kaggle/Colab GPU (legacy)
-  # Set LLM_PROVIDER=transformers in the notebook, model loads inline
+Architecture:
+  Brain 1: Groq Llama-3.3-70b  → Plans tasks, splits multi-step prompts
+  Brain 2: CogAgent (Kaggle)    → Vision agent: screenshot → coordinates → actions
+  
+Quick start:
+  1. Set GROQ_API_KEY in .env (free: https://console.groq.com)
+  2. Set COGAGENT_URL in .env (from Kaggle notebook ngrok URL)
+  3. python langchain_backend.py
 """
 
-import os, re, json, base64, logging, traceback, gc
+import os, re, json, base64, logging, traceback, gc, httpx
 from io import BytesIO
 from typing import Dict, List, Optional
 from datetime import datetime
@@ -47,73 +25,29 @@ import uvicorn
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Config (from .env or environment)
-# ─────────────────────────────────────────────────────────────────────────────
-
+# ─── ENV ─────────────────────────────────────────────────────────────────────
 try:
     from dotenv import load_dotenv; load_dotenv()
 except ImportError:
     pass
 
-LLM_PROVIDER    = os.getenv("LLM_PROVIDER",    "groq")            # ← default: Groq (free, fast)
-OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
-OLLAMA_MODEL    = os.getenv("OLLAMA_MODEL",    "llama3")
-GROQ_API_KEY    = os.getenv("GROQ_API_KEY",    "")
-GROQ_MODEL      = os.getenv("GROQ_MODEL",      "llama-3.3-70b-versatile")   # free tier
-HF_API_KEY      = os.getenv("HF_API_KEY",      "")
-HF_MODEL        = os.getenv("HF_MODEL",        "mistralai/Mistral-7B-Instruct-v0.3")
-HF_LOCAL_MODEL  = os.getenv("HF_LOCAL_MODEL",  "Qwen/Qwen2.5-7B-Instruct")  # transformers provider
-OPENAI_API_KEY  = os.getenv("OPENAI_API_KEY",  "")
-OPENAI_MODEL    = os.getenv("OPENAI_MODEL",    "gpt-4o")
-GEMINI_API_KEY  = os.getenv("GEMINI_API_KEY",  "")               # ← default vision provider
-GEMINI_MODEL    = os.getenv("GEMINI_MODEL",    "gemini-2.0-flash")  # free tier
-VISION_PROVIDER = os.getenv("VISION_PROVIDER", "gemini")         # ← default: Gemini vision
+GROQ_API_KEY    = os.getenv("GROQ_API_KEY", "")
+GROQ_MODEL      = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
+COGAGENT_URL    = os.getenv("COGAGENT_URL", "")
+GEMINI_API_KEY  = os.getenv("GEMINI_API_KEY", "")
+GEMINI_MODEL    = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
 MAX_RETRIES     = int(os.getenv("MAX_RETRIES", "3"))
-MAX_ITERATIONS  = int(os.getenv("MAX_ITERATIONS", "12"))
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Optional dependency flags
-# ─────────────────────────────────────────────────────────────────────────────
+import pathlib as _pathlib
+_USER_HOME = str(_pathlib.Path.home()).replace("\\", "\\\\")
+_USER_NAME = _pathlib.Path.home().name
 
-HAS_OPENAI       = False
-HAS_OLLAMA       = False
-HAS_GROQ         = False
-HAS_HF_HUB       = False
-HAS_TRANSFORMERS = False
-HAS_PIL          = False
-HAS_GEMINI       = False
-
-try:
-    from langchain_openai import ChatOpenAI; HAS_OPENAI = True
-except ImportError: pass
-
-try:
-    from langchain_community.chat_models import ChatOllama; HAS_OLLAMA = True
-except ImportError:
-    try:
-        from langchain_ollama import ChatOllama; HAS_OLLAMA = True
-    except ImportError: pass
+# ─── DEPS ────────────────────────────────────────────────────────────────────
+HAS_GROQ = False
+HAS_GEMINI = False
 
 try:
     from langchain_groq import ChatGroq; HAS_GROQ = True
-except ImportError: pass
-
-try:
-    from langchain_community.llms import HuggingFaceEndpoint
-    from langchain_community.chat_models.huggingface import ChatHuggingFace
-    HAS_HF_HUB = True
-except ImportError: pass
-
-try:
-    import torch
-    from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig, pipeline
-    from langchain_community.llms import HuggingFacePipeline
-    HAS_TRANSFORMERS = True
-except ImportError: pass
-
-try:
-    from PIL import Image; HAS_PIL = True
 except ImportError: pass
 
 try:
@@ -122,15 +56,7 @@ except ImportError: pass
 
 from langchain_core.messages import HumanMessage
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Session store (in-memory, per-request retry state)
-# ─────────────────────────────────────────────────────────────────────────────
-
-sessions: Dict[str, Dict] = {}
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Request / Response models
-# ─────────────────────────────────────────────────────────────────────────────
+# ─── REQUEST MODELS ──────────────────────────────────────────────────────────
 
 class ChatRequest(BaseModel):
     message:              str
@@ -140,567 +66,210 @@ class ChatRequest(BaseModel):
     screen_height:        Optional[int] = 1080
     user_choice:          Optional[Dict] = None
     session_id:           Optional[str] = None
+    user_home:            Optional[str] = None
 
-class ContinueRequest(BaseModel):
-    session_id:     str
-    action_results: List[Dict]
-    screenshot:     Optional[str] = None
-
-class AnalyzeScreenRequest(BaseModel):
-    screenshot: Optional[str] = None
-    question:   Optional[str] = "What do you see on screen?"
+class VisionActRequest(BaseModel):
+    screenshot:        str
+    goal:              str
+    step_history:      List[Dict] = []
+    screen_width:      Optional[int] = 1920
+    screen_height:     Optional[int] = 1080
+    cogagent_url:      Optional[str] = None
 
 class VerifyRequest(BaseModel):
     screenshot:      str
     task:            str
     expected_result: Optional[str] = ""
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Action catalog — everything the Electron side can execute
-# ─────────────────────────────────────────────────────────────────────────────
+class NextStepRequest(BaseModel):
+    original_task:     str
+    last_action:       Dict
+    last_result:       Dict
+    screenshot:        Optional[str] = None
+    remaining_actions: List[Dict] = []
+    completed_actions: List[Dict] = []
+
+class GeneratePPTRequest(BaseModel):
+    topic:                   str
+    title:                   Optional[str] = None
+    num_slides:              int = 5
+    theme:                   str = "gamma_modern"
+    save_path:               str = "Desktop"
+    additional_instructions: Optional[str] = None
+
+class AnalyzeScreenRequest(BaseModel):
+    screenshot: Optional[str] = None
+    question:   Optional[str] = "What do you see on screen?"
+
+class BrowserStateRequest(BaseModel):
+    screenshot: str = ""
+
+# ─── ACTION CATALOG ──────────────────────────────────────────────────────────
 
 ACTION_CATALOG = """
-=== VISION / SCREEN ANALYSIS ===
-get_screenshot(question)           — capture the current screen and use AI vision to answer the question
-describe_screen()                  — describe everything visible on screen right now
-analyze_screen(question)           — ask a specific question about screen content
+=== VISION AGENT (★ USE FOR ALL GUI/BROWSER TASKS) ===
+vision_task(goal, max_steps)
+    ★ ALWAYS use for ANY browser, website, or GUI interaction.
+    AI takes screenshots → identifies UI elements → clicks/types at pixel coordinates.
+    goal = detailed description with ALL details (URLs, emails, text)
+    max_steps = limit (default 30)
 
+=== SCREEN ANALYSIS ===
+get_screenshot(question) | describe_screen() | analyze_screen(question)
 
+=== FILE OPERATIONS ===
 create_file(file_path, content) | create_folder(folder_path) | delete_file(file_path)
-read_file(file_path)            — read full content of any file (txt, md, csv, py, docx, etc.)
-find_in_file(file_path, search_text)                          — find text in file, returns matching lines/paragraphs/slides
-replace_in_file(file_path, search_text, replacement_text)     — replace text in any file (plain text, Word, or PPT)
-append_to_file(file_path, content)                            — append content to end of file
+read_file(file_path) | append_to_file(file_path, content)
+find_in_file(file_path, search_text) | replace_in_file(file_path, search_text, replacement_text)
 list_directory(path) | copy_file(source, destination)
 move_file(source, destination) | rename_file(old_path, new_name)
-search_files(pattern, location) | search_file_content(search_text, location, file_pattern)
-open_file(file_path) | show_in_explorer(file_path)
+search_files(pattern, location) | open_file(file_path) | show_in_explorer(file_path)
 
 === APPLICATION CONTROL ===
 open_application(app_name) | close_application(app_name) | open_url(url)
-search_web(query) | focus_app(app_name) | download_file(url, filename)
+search_web(query)                → Opens Google search results for the query
+focus_app(app_name)             → Brings an already-open app to the foreground
 
-=== MOUSE / KEYBOARD ===
-click_at(x, y, click_type) | move_mouse(x, y) | scroll(direction, amount)
-drag(start_x, start_y, end_x, end_y) | type_text(text) | type_into_app(app_name, text)
-press_key(key) | hotkey(key) | wait(duration)
+=== SYSTEM CONTROLS ===
+set_volume(volume)              → 0-100
+set_brightness(brightness)      → 0-100 (laptops only)
+toggle_wifi(enable)             → enable=true/false, needs admin for some adapters
+toggle_bluetooth(enable)        → enable=true/false, needs admin
+toggle_night_light(enable)      → enable=true/false (blue light filter)
+toggle_dark_mode(enable)        → enable=true/false (system-wide dark mode)
+set_wallpaper(image_path)       → Full path to image file
+lock_computer() | sleep_computer()
+get_battery_status() | get_system_info() | get_disk_space()
+get_network_status() | empty_recycle_bin()
+speak(message)                  → Text-to-speech
+show_notification(title, message) → Windows toast notification
+get_clipboard() | set_clipboard(text)
 
-=== SYSTEM CORE ===
-set_volume(volume) | set_brightness(brightness) | toggle_wifi(enable)
-toggle_bluetooth(enable) | toggle_night_light(enable) | set_wallpaper(image_path)
-lock_computer() | sleep_computer() | get_battery_status() | get_system_info()
-get_disk_space() | get_network_status() | empty_recycle_bin() | run_disk_cleanup()
-set_resolution(width, height) | speak(message)
+=== OS TASKS ===
+clear_cache(cache_type)         → type: 'all', 'temp', 'browser', 'dns'
+flush_dns() | reset_network()
+open_task_manager() | open_control_panel() | open_device_manager()
+manage_service(service_name, action) → action: 'start', 'stop', 'restart'
+get_running_processes() | kill_process(name_or_pid)
+get_system_health() | get_power_plan() | set_power_plan(plan)
+restart_computer(delay) | shutdown_computer(delay) | cancel_shutdown()
 
-=== OS TASKS (EXTENDED) ===
-clear_cache(cache_type)            - type: temp/dns/browser/arp/icon/chrome/edge/firefox/all
-flush_dns() | reset_network() | ping_host(host, count) | check_port(host, port) | get_public_ip()
-run_winr(command)                  - execute any Win+R dialog command
-open_msconfig() | open_services() | open_device_manager() | open_regedit()
-open_event_viewer() | open_task_scheduler() | open_firewall() | open_network_connections()
-open_power_options() | open_windows_update() | open_task_manager() | open_control_panel()
-open_cmd() | open_powershell() | open_cmd_admin() | open_powershell_admin()
-manage_service(service_name, action)  - start/stop/restart/status/enable/disable
-list_services(filter) | get_running_processes() | kill_process(name_or_pid)
-list_startup_programs() | toggle_startup_program(name, enable)
-check_windows_update() | get_update_history()
-get_event_logs(log_type, count, level) | clear_event_log(log_type)
-create_restore_point(description) | list_restore_points()
-get_installed_apps() | uninstall_app(app_name)
-get_env_variable(name) | set_env_variable(name, value, scope) | delete_env_variable(name)
-read_registry(key_path, value_name) | write_registry(key_path, value_name, value)
-get_disk_health() | analyze_storage(path) | run_disk_cleanup_silent()
-get_power_plan() | set_power_plan(plan)   - balanced/high_performance/power_saver
-hibernate() | restart_computer(delay) | shutdown_computer(delay) | cancel_shutdown()
-windows_defender_scan() | get_defender_status() | check_firewall()
-list_scheduled_tasks() | run_scheduled_task(name) | disable_scheduled_task(name)
-toggle_dark_mode(enable) | enable_dark_mode() | light_mode() | refresh_desktop()
-get_clipboard() | set_clipboard(text) | show_notification(title, message) | list_fonts()
-get_system_health()
+=== MS OFFICE — POWERPOINT (AUTO-OPENS ON SCREEN WHEN DONE) ===
+generate_ppt(topic, title, num_slides, theme, save_path, additional_instructions)
+    → Creates professional .pptx and AUTO-OPENS it in PowerPoint on screen
+ppt_find_slide(search_text) | ppt_get_slide_content(slide_number)
+ppt_update_slide_text(slide_number, old_text, new_text)
+ppt_apply_theme(theme_name) | ppt_add_animation(animation_type)
+ppt_change_layout(layout_name)
 
-=== BROWSER AUTOMATION ===
-browser_open(url, browser) | browser_navigate(url) | browser_click(selector)
-browser_type(selector, text) | browser_get_text(selector) | browser_screenshot()
-browser_scroll(direction, amount) | browser_wait_for(selector) | browser_close()
-browser_go_back() | browser_new_tab(url) | browser_reload() | browser_fill_form(fields)
-browser_smart_login(url, name, email, password, is_new_user)  — login OR signup, auto-detects form type
-browser_signup(url, name, email, password)                    — explicitly create a new account
-browser_search_in_page(text)                                  — type into search bar / ChatGPT prompt and submit
-browser_chat(text)                                            — alias for browser_search_in_page (for AI chat sites)
-browser_detect_page()                                         — returns: login | signup | chat | search | main
-open_gmail(email)                                             — open Gmail for a SPECIFIC account email (auto-detects which slot u/0, u/1, etc.)
-send_gmail(to, subject, body, account_email)                  — send email; account_email selects which Gmail account to send FROM
-google_search(query) | youtube_search(query)
-browser_execute_script(script) | install_playwright()
+=== MS OFFICE — WORD (AUTO-OPENS ON SCREEN WHEN DONE) ===
+word_create_document(title, content)
+    → Creates .docx document and opens it in Word on screen
+word_open_document(filepath) | word_read_content()
+word_add_paragraph(text) | word_add_heading(text, level)
+word_find_replace(search_text, replacement_text)
+word_insert_table(rows, cols) | word_apply_theme(theme_name)
+word_save(filename) | word_change_font(font_name, font_size)
 
-=== MS OFFICE — WORD ===
-word_create_document(title, content) | word_open_document(filepath)
-word_read_content()                                           — read all paragraphs from open Word doc
-word_find_replace(search_text, replacement_text)              — find & replace text in open Word doc
-word_add_paragraph(text, bold, italic, font_size, color, alignment)
-word_add_heading(text, level) | word_insert_table(rows, cols)
-word_apply_theme(theme_name) | word_save(filename)
+=== MS OFFICE — EXCEL (AUTO-OPENS ON SCREEN WHEN DONE) ===
+excel_create_workbook()
+    → Creates .xlsx workbook and opens it in Excel on screen
+excel_open_workbook(filepath) | excel_write_cell(row, col, value)
+excel_write_data(data) | excel_add_worksheet(name)
+excel_create_chart(chart_type) | excel_format_cell(row, col, options)
+excel_autofit_columns() | excel_save(filename)
 
-=== MS OFFICE — EXCEL ===
-excel_create_workbook() | excel_open_workbook(filepath)
-excel_write_cell(row, col, value) | excel_write_data(data)
-excel_add_worksheet(name) | excel_create_chart(chart_type) | excel_save(filename)
+=== MS OFFICE — ONENOTE ===
+onenote_open()                  → Opens OneNote application
+onenote_create_page(title)      → Creates a new page with given title
+onenote_add_content(content)    → Adds text content to the current page
+onenote_list_notebooks()        → Lists all notebooks and their sections
 
-=== MS OFFICE — POWERPOINT ===
-create_presentation(title, save_path, slides_content)         — CREATE a full PPT from scratch with all slides at once
-powerpoint_new_slide() | powerpoint_add_title(title) | powerpoint_add_content(content)
-ppt_apply_theme(theme_name) | ppt_add_animation(animation_type) | ppt_change_layout(layout)
-ppt_find_slide(search_text)                                   — find slides containing text, returns slide numbers
-ppt_get_slide_content(slide_number)                           — read all text shapes from a slide
-ppt_update_slide_text(slide_number, old_text, new_text)       — replace text on a specific slide
-
-TYPICAL WORKFLOW for modifying an existing file:
-  1. open_file(file_path)            — open the file in its app
-  2. read_file(file_path)            — read content so you know what's there
-  3. find_in_file(file_path, text)   — locate the section to change
-  4. replace_in_file(file_path, old, new) — make the change
-     OR for Word: word_find_replace(old, new)
-     OR for PPT:  ppt_find_slide(text) → ppt_update_slide_text(num, old, new)
+=== MS OFFICE — PUBLISHER ===
+publisher_create(template_type) → Creates a new publication (blank by default)
+publisher_add_textbox(text, left, top, width, height) → Adds a text box
+publisher_add_page()            → Adds a new page
+publisher_save(filename)        → Saves the publication
 """
 
-# ─────────────────────────────────────────────────────────────────────────────
-# System prompt
-# ─────────────────────────────────────────────────────────────────────────────
+# ─── SYSTEM PROMPT ───────────────────────────────────────────────────────────
 
-SYSTEM_PROMPT = f"""You are Pecifics, an intelligent AI desktop assistant for Windows 11.
-You operate exactly like GitHub Copilot / Claude Sonnet — you think step-by-step, ask clarifying questions before acting on ambiguous tasks, execute actions autonomously, and provide complete human-readable summaries.
+SYSTEM_PROMPT = f"""You are Pecifics, an AI desktop assistant for Windows 11.
+You work like Claude Computer Use — you see the screen and control it.
 
-AVAILABLE ACTIONS:
+EXECUTION MODEL:
+- For ALL browser/GUI tasks → vision_task(goal="..."). The vision agent sees the screen and clicks.
+- For file/system/non-GUI tasks → use the specific action directly.
+- NEVER use browser_click, browser_type, or CSS selectors.
+
+MULTI-TASK HANDLING:
+- Users may give 3-4 tasks in one prompt.
+- You MUST split them and return ALL tasks in the tasks array.
+- Example: "Open Chrome, create a file on desktop, and set volume to 50"
+  → 3 separate tasks, each with its own actions.
+
+USER INFO:
+- Home: {_USER_HOME}  |  Username: {_USER_NAME}
+- ALWAYS use real path. NEVER use "USERNAME" placeholder.
+
+ASKING FOR INPUT:
+- If task is missing CRITICAL info → set needs_input=true with input_fields
+- Needs input ONLY WHEN NOT PROVIDED: save file (filename+location), send email (to address if missing),
+  create PPT (topic if unclear), delete (confirmation needed)
+- If user already provided enough info (e.g. "write a mail saying I won't attend tomorrow"),
+  DO NOT ask for input — use vision_task with a detailed goal instead.
+- No input needed: open apps, volume, system info, open websites, compose email with given content
+
 {ACTION_CATALOG}
 
-═══════════════════════════════════════════════════════
-BEHAVIOR RULES (follow these EXACTLY like Claude would)
-═══════════════════════════════════════════════════════
-
-1. ALWAYS ASK BEFORE CREATING/SAVING FILES:
-   - If the user says "save this", "create a doc", "make a file", "write a report" etc. and has NOT provided a filename or save location → set clarification_needed=true and ask for both.
-   - Fields to ask: filename (with extension), save_path (default suggestion: Desktop or Documents).
-
-2. ALWAYS ASK BEFORE CREATING PRESENTATIONS (PPT):
-   - Ask: title, topic/content, number of slides, save location.
-   - Use action: create_presentation(title, slides_content, save_path) where slides_content is a JSON array of {{title, content}} objects.
-   - create_presentation automatically saves AND opens PowerPoint to show the result — do NOT add a separate open_file action.
-
-3. TASKS THAT ALWAYS NEED CLARIFICATION:
-   - Save/create any document → ask filename + location
-   - Send email → ask recipient, subject, body if not provided; if user has multiple Gmail accounts ask WHICH one to send from (account_email)
-   - Open Gmail → if the user has said they have multiple accounts OR the message is ambiguous, ask: "Which Gmail account? (e.g. work@gmail.com or personal@gmail.com)"
-   - Login to a website → ask email + password if not provided
-   - Sign up / create account → ask name, email, password (+ confirm what site)
-   - Create PPT/presentation → ask title, topic, slides, save path
-   - Delete files → ask for confirmation (use requires_choice=true with Yes/No)
-   - If user says "search X on ChatGPT" but not logged in → ask: "Do you need me to log in first? If yes, provide email and password."
-
-4. TASKS THAT DON'T NEED CLARIFICATION (just do them):
-   - Open applications, websites, system tools (just open — no login needed)
-   - Volume, brightness, bluetooth, wifi controls
-   - Browser navigation: open site → search/type something on it (no account required)
-   - System info, battery, disk space
-   - Take screenshot, show notifications
-   - "Open ChatGPT in browser" with no login request → just browser_open + browser_search_in_page
-
-5. TASK SUMMARY:
-   - ALWAYS include a task_summary field — a clear human-readable summary of what you are about to do (or did), written in first person past tense once actions are listed.
-   - Example: "I'll create a 5-slide PowerPoint presentation titled 'Q1 Sales Report', save it to your Desktop, and open it in PowerPoint."
-
-6. BROWSER RULES — GMAIL MULTI-ACCOUNT:
-   - Gmail supports multiple signed-in accounts at /mail/u/0/, /mail/u/1/, etc.
-   - When user says "open my Gmail" or "open Gmail" and a specific email is given or implied: use open_gmail(email=\"their@email.com\")
-   - open_gmail scans all account slots, finds the matching one, and navigates directly to it.
-   - If no email is specified AND context implies they may have multiple accounts: ask which one.
-   - When sending email, always set account_email to the sender’s address: send_gmail(to, subject, body, account_email=\"sender@gmail.com\")
-   - NEVER use browser_open(\"https://mail.google.com\") without account_email when a specific account was requested.
-
-   EMAIL FLOW EXAMPLE — \"Open my work Gmail and send an email to X\":
-     clarify: which work account address? (if not already known)
-     1. open_gmail(email=\"work@gmail.com\")
-     2. send_gmail(to=\"x@example.com\", subject=\"...\", body=\"...\", account_email=\"work@gmail.com\")
-
-7. BROWSER RULES — GENERAL:
-   - Use browser_open with DIRECT URL — never use search_web to navigate to a known site.
-   - For LOGIN to existing account: browser_smart_login(url, email, password, is_new_user=false)
-   - For SIGNUP / creating a new account: browser_smart_login(url, name, email, password, is_new_user=true)
-     → It auto-clicks the “Sign up” link, fills name/email/password fields, handles confirm-password
-   - For SEARCHING on any site or CHATTING with ChatGPT/AI: browser_search_in_page(text)
-     → Works with ChatGPT prompt, YouTube search bar, Google search, Bing, site search boxes
-   - For TYPING into a page’s chat/search without submitting: browser_type(selector, text)
-   - Selectors: use input[type="email"], input[type="password"], button[type="submit"] — never generic class names.
-   - Complex browser flows (open site → login/signup → search/use it) should be described as: clarify credentials if not provided, then use browser_smart_login + browser_search_in_page
-
-   EXAMPLE FLOWS:
-   “Open ChatGPT and ask it about climate change”:
-     1. browser_open(url="https://chat.openai.com")
-     2. browser_search_in_page(text="Tell me about climate change")
-
-   “Open ChatGPT, sign me in, then search X” (ask for credentials first):
-     1. browser_smart_login(url="https://chat.openai.com", email=EMAIL, password=PASS, is_new_user=false)
-     2. browser_search_in_page(text="X")
-
-   “Create a ChatGPT account” (ask name/email/password first):
-     1. browser_smart_login(url="https://chat.openai.com", name=NAME, email=EMAIL, password=PASS, is_new_user=true)
-
-   “Open Google and search for AI news”:
-     1. browser_open(url="https://www.google.com")
-     2. browser_search_in_page(text="AI news 2026")
-
-8. OUTPUT FORMAT (ALWAYS valid JSON, no markdown code blocks):
+OUTPUT FORMAT (ALWAYS valid JSON, no markdown):
 {{
-  "message": "Brief one-line description of what you're doing",
-  "task_summary": "Complete human-readable explanation of what will happen, step by step",
-  "clarification_needed": false,
-  "clarification_question": "",
-  "clarification_fields": [],
-  "actions": [
-    {{"name": "action_name", "parameters": {{"param": "value"}}}}
+  "message": "Brief summary of all tasks",
+  "tasks": [
+    {{
+      "id": 1,
+      "description": "Open Chrome and search for weather",
+      "needs_input": false,
+      "input_fields": [],
+      "actions": [{{"name": "vision_task", "parameters": {{"goal": "Open Chrome. Go to google.com. Type 'weather'. Press Enter."}}}}]
+    }},
+    {{
+      "id": 2,
+      "description": "Create a text file",
+      "needs_input": true,
+      "input_fields": [
+        {{"key": "filename", "label": "File Name", "placeholder": "e.g. notes.txt", "default": "notes.txt"}},
+        {{"key": "content", "label": "Content", "placeholder": "What to write?", "default": ""}}
+      ],
+      "actions": []
+    }}
   ],
-  "expected_result": "What should be true after all actions complete",
-  "requires_choice": false,
-  "choice_type": null,
-  "choice_options": [],
-  "pending_task": null,
-  "session_continues": false
+  "expected_result": "Chrome shows weather results and file is created"
 }}
 
-CLARIFICATION FIELDS FORMAT:
-{{
-  "clarification_needed": true,
-  "clarification_question": "To save your document, I need a couple of details:",
-  "clarification_fields": [
-    {{"key": "filename", "label": "File Name", "placeholder": "e.g. MyReport.docx", "default": "Document.docx"}},
-    {{"key": "save_path", "label": "Save Location", "placeholder": "e.g. Desktop, C:\\\\Users\\\\...", "default": "Desktop"}}
-  ],
-  "actions": [],
-  "task_summary": "Once you provide details, I'll create and save the document.",
-  "message": "I need a few details before I can save the file."
-}}
+VISION TASK GOALS — be VERY detailed:
+  "Open Chrome. Navigate to https://mail.google.com. Click Compose button. Type bob@test.com in To field. Type 'Meeting' in Subject. Type email body. Click Send."
 
-PPT CREATION EXAMPLE (single action — it saves and opens the file automatically):
-  create_presentation(title="Q1 Report", save_path="C:\\\\Users\\\\USERNAME\\\\Desktop\\\\Q1Report.pptx",
-    slides_content=[
-      {{"slide_title": "Introduction", "slide_content": "Overview of Q1 performance"}},
-      {{"slide_title": "Revenue", "slide_content": "Revenue grew 20% YoY. Key drivers: product A and B."}}
-    ])
-"""
+KEY RULES:
+1. Include ALL info in vision_task goals (URLs, emails, text content)
+2. Start goals with "Open Chrome." if browser isn't open
+3. Gmail user is already logged in — skip login steps
+4. For PPT (any "create presentation/slides/ppt"): use generate_ppt action → it AUTO-OPENS in PowerPoint
+5. For Word docs ("create document/report/letter"): use word_create_document → AUTO-OPENS in Word
+6. For Excel ("create spreadsheet/workbook/table"): use excel_create_workbook → AUTO-OPENS in Excel
+7. For file ops: use create_file, read_file etc. (not vision_task)
+8. NEVER use generate_ppt + vision_task for same PPT — generate_ppt does everything
+9. ALWAYS return tasks array even for single tasks
+10. ALL Office actions open on screen automatically — no extra open_file needed"""
 
-# ─────────────────────────────────────────────────────────────────────────────
-# LLM factory
-# ─────────────────────────────────────────────────────────────────────────────
-
-_cached_transformers_llm = None
-
-
-def _load_transformers_llm():
-    """Load a local HuggingFace checkpoint and wrap it as a LangChain LLM.
-    Reuses the global vision/text model if already loaded by the Kaggle notebook."""
-    global _cached_transformers_llm
-    if _cached_transformers_llm is not None:
-        return _cached_transformers_llm
-
-    if not HAS_TRANSFORMERS:
-        raise ImportError("pip install transformers accelerate bitsandbytes")
-
-    # Check if the Kaggle notebook already loaded a text model
-    import sys
-    g = sys._getframe(0).f_globals
-    text_model     = g.get("text_model")
-    text_tokenizer = g.get("text_tokenizer")
-
-    if text_model and text_tokenizer:
-        logger.info("Reusing already-loaded text_model from notebook globals.")
-        pipe = pipeline(
-            "text-generation", model=text_model, tokenizer=text_tokenizer,
-            max_new_tokens=1024, temperature=0.1, do_sample=True,
-            pad_token_id=text_tokenizer.eos_token_id,
-        )
-        _cached_transformers_llm = HuggingFacePipeline(pipeline=pipe)
-        return _cached_transformers_llm
-
-    model_id = HF_LOCAL_MODEL
-    logger.info(f"Loading {model_id} …")
-    gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-
-    bnb_cfg = None
-    if torch.cuda.is_available():
-        try:
-            bnb_cfg = BitsAndBytesConfig(
-                load_in_4bit=True, bnb_4bit_quant_type="nf4",
-                bnb_4bit_compute_dtype=torch.float16, bnb_4bit_use_double_quant=True,
-            )
-        except Exception:
-            pass
-
-    tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
-    model = AutoModelForCausalLM.from_pretrained(
-        model_id,
-        torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
-        device_map="auto" if torch.cuda.is_available() else None,
-        quantization_config=bnb_cfg,
-        trust_remote_code=True,
-        low_cpu_mem_usage=True,
-    ).eval()
-
-    pipe = pipeline(
-        "text-generation", model=model, tokenizer=tokenizer,
-        max_new_tokens=1024, temperature=0.1, do_sample=True,
-        pad_token_id=tokenizer.eos_token_id,
-    )
-    _cached_transformers_llm = HuggingFacePipeline(pipeline=pipe)
-    logger.info("Local model ready.")
-    return _cached_transformers_llm
-
-
-def create_llm():
-    provider = LLM_PROVIDER.lower()
-
-    if provider == "ollama":
-        if not HAS_OLLAMA:
-            raise ImportError("pip install langchain-community  (or langchain-ollama)")
-        logger.info(f"Using Ollama — {OLLAMA_MODEL} @ {OLLAMA_BASE_URL}")
-        return ChatOllama(model=OLLAMA_MODEL, base_url=OLLAMA_BASE_URL, temperature=0.1)
-
-    if provider == "groq":
-        if not HAS_GROQ:
-            raise ImportError("pip install langchain-groq")
-        if not GROQ_API_KEY:
-            raise ValueError("GROQ_API_KEY not set. Free key → https://console.groq.com")
-        logger.info(f"Using Groq — {GROQ_MODEL}")
-        return ChatGroq(api_key=GROQ_API_KEY, model_name=GROQ_MODEL, temperature=0.1)
-
-    if provider == "huggingface":
-        if not HAS_HF_HUB:
-            raise ImportError("pip install langchain-community")
-        if not HF_API_KEY:
-            raise ValueError("HF_API_KEY not set. Free token → https://huggingface.co/settings/tokens")
-        logger.info(f"Using HuggingFace Inference API — {HF_MODEL}")
-        llm = HuggingFaceEndpoint(
-            repo_id=HF_MODEL, huggingfacehub_api_token=HF_API_KEY,
-            temperature=0.1, max_new_tokens=1024,
-        )
-        return ChatHuggingFace(llm=llm)
-
-    if provider == "transformers":
-        logger.info(f"Using local transformers — {HF_LOCAL_MODEL}")
-        return _load_transformers_llm()
-
-    if provider == "openai":
-        if not HAS_OPENAI:
-            raise ImportError("pip install langchain-openai")
-        if not OPENAI_API_KEY:
-            raise ValueError("OPENAI_API_KEY not set.")
-        logger.info(f"Using OpenAI — {OPENAI_MODEL}")
-        return ChatOpenAI(model=OPENAI_MODEL, api_key=OPENAI_API_KEY, temperature=0.1, max_retries=3)
-
-    raise ValueError(
-        f"Unknown LLM_PROVIDER='{provider}'. "
-        "Valid: ollama | groq | huggingface | transformers | openai"
-    )
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Vision helpers
-# ─────────────────────────────────────────────────────────────────────────────
-
-def describe_screenshot(b64: str, llm) -> str:
-    if not b64:
-        return "No screenshot available."
-
-    vision = VISION_PROVIDER.lower()
-
-    # ── Gemini vision (default, free tier) ──────────────────────────────────
-    if vision == "gemini" and HAS_GEMINI and GEMINI_API_KEY:
-        try:
-            genai.configure(api_key=GEMINI_API_KEY)
-            model = genai.GenerativeModel(GEMINI_MODEL)
-            img_data = base64.b64decode(b64)
-            img_part = {"mime_type": "image/jpeg", "data": img_data}
-            resp = model.generate_content([
-                "Describe this Windows desktop screenshot in ≤100 words: open windows, active app, visible text, current state.",
-                img_part,
-            ])
-            return resp.text.strip()
-        except Exception as e:
-            logger.warning(f"Gemini vision failed: {e} — falling back.")
-
-    # ── GPT-4o vision ────────────────────────────────────────────────────────
-    if vision == "openai" and HAS_OPENAI and OPENAI_API_KEY:
-        try:
-            vis = ChatOpenAI(model="gpt-4o", api_key=OPENAI_API_KEY, temperature=0, max_tokens=300)
-            resp = vis.invoke([HumanMessage(content=[
-                {"type": "text", "text": "Describe this Windows desktop screenshot in ≤100 words: open windows, active app, visible text, current state."},
-                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}", "detail": "low"}},
-            ])])
-            return resp.content
-        except Exception as e:
-            logger.warning(f"GPT-4V: {e}")
-
-    # ── Ollama vision (llava / moondream / bakllava) ─────────────────────────
-    if vision == "ollama" or LLM_PROVIDER == "ollama":
-        for vm in ("llava", "moondream", "bakllava", "llava-llama3"):
-            try:
-                import requests as _r
-                r = _r.post(f"{OLLAMA_BASE_URL}/api/generate",
-                            json={"model": vm, "prompt": "Describe this Windows screen briefly.", "images": [b64], "stream": False},
-                            timeout=15)
-                if r.ok:
-                    return r.json().get("response", "Screen captured.")
-            except Exception:
-                continue
-
-    # ── Local transformers vision (Qwen2-VL etc.) ──────────────────────────
-    if (vision == "transformers" or LLM_PROVIDER == "transformers") and HAS_TRANSFORMERS and HAS_PIL:
-        try:
-            import sys
-            g = sys._getframe(0).f_globals
-            vm = g.get("vision_model") or g.get("LOADED_VISION_MODEL")
-            vp = g.get("vision_processor") or g.get("LOADED_VISION_PROCESSOR")
-            if vm and vp:
-                img = Image.open(BytesIO(base64.b64decode(b64))).convert("RGB")
-                msgs = [{"role": "user", "content": [
-                    {"type": "image", "image": img},
-                    {"type": "text", "text": "Describe what's on this Windows screen in 80 words."},
-                ]}]
-                text = vp.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
-                inp = vp(text=[text], images=[img], return_tensors="pt").to(vm.device)
-                with torch.no_grad():
-                    out = vm.generate(**inp, max_new_tokens=200)
-                return vp.batch_decode(
-                    [o[inp.input_ids.shape[1]:] for o in out], skip_special_tokens=True
-                )[0].strip()
-        except Exception as e:
-            logger.warning(f"Transformers vision: {e}")
-
-    return "Screenshot captured. Vision analysis unavailable for this provider — proceeding with text-only planning."
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# LLM invocation wrapper (supports both chat models and text pipelines)
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _call(llm, prompt: str) -> str:
-    try:
-        resp = llm.invoke([HumanMessage(content=prompt)])
-        return resp.content if hasattr(resp, "content") else str(resp)
-    except TypeError:
-        return llm.invoke(prompt)
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Core planning / verification
-# ─────────────────────────────────────────────────────────────────────────────
-
-def plan_actions(
-    user_message: str,
-    screenshot_b64: Optional[str],
-    conversation_history: List[Dict],
-    screen_width: int,
-    screen_height: int,
-    user_choice: Optional[Dict],
-    llm,
-    retry_count: int = 0,
-    previous_error: Optional[str] = None,
-) -> Dict:
-
-    history_txt = "\n".join(
-        f"{'User' if t.get('role')=='user' else 'Assistant'}: {t.get('content','')}"
-        for t in conversation_history[-6:]
-    )
-    screen_desc = describe_screenshot(screenshot_b64, llm) if screenshot_b64 else "No screenshot."
-    retry_ctx = (
-        f"\n\nPREVIOUS ATTEMPT FAILED: {previous_error}\nUse a DIFFERENT approach this time."
-        if retry_count > 0 and previous_error else ""
-    )
-    if user_choice:
-        user_message += f"\n[User selected: {user_choice.get('type')} = {user_choice.get('value')}]"
-
-    prompt = f"""{SYSTEM_PROMPT}
-
-CURRENT SCREEN: {screen_desc}
-SCREEN SIZE: {screen_width}x{screen_height}
-
-CONVERSATION HISTORY:
-{history_txt}
-{retry_ctx}
-
-USER REQUEST: {user_message}
-
-Reply ONLY with valid JSON — no markdown, no extra text."""
-
-    try:
-        raw = _call(llm, prompt).strip()
-        raw = re.sub(r"^```(?:json)?\s*", "", raw)
-        raw = re.sub(r"\s*```$", "", raw)
-        result = json.loads(raw)
-        result.setdefault("message", "Processing…")
-        result.setdefault("task_summary", "")
-        result.setdefault("actions", [])
-        result.setdefault("expected_result", "")
-        result.setdefault("task_count", len(result["actions"]))
-        result.setdefault("requires_choice", False)
-        result.setdefault("choice_options", [])
-        result.setdefault("clarification_needed", False)
-        result.setdefault("clarification_question", "")
-        result.setdefault("clarification_fields", [])
-        result.setdefault("session_continues", False)
-        return result
-
-    except json.JSONDecodeError as e:
-        logger.error(f"JSON parse error (attempt {retry_count+1}): {e}")
-        if retry_count < MAX_RETRIES:
-            return plan_actions(user_message, screenshot_b64, conversation_history,
-                                screen_width, screen_height, user_choice, llm,
-                                retry_count + 1, f"JSON parse error: {e}. Return ONLY raw JSON.")
-        return {"message": "I had trouble planning that. Please rephrase.", "actions": [],
-                "task_count": 0, "requires_choice": False, "error": str(e)}
-
-    except Exception as e:
-        logger.error(f"LLM failed: {e}")
-        if retry_count < MAX_RETRIES:
-            return plan_actions(user_message, screenshot_b64, conversation_history,
-                                screen_width, screen_height, user_choice, llm,
-                                retry_count + 1, str(e))
-        return {"message": f"Error: {e}", "actions": [], "task_count": 0,
-                "requires_choice": False, "error": str(e)}
-
-
-def verify_completion(screenshot_b64: str, task: str, expected: str, llm) -> Dict:
-    screen = describe_screenshot(screenshot_b64, llm) if screenshot_b64 else "No screenshot."
-    prompt = f"""{SYSTEM_PROMPT}
-
-Task just executed: "{task}"
-Expected result: "{expected}"
-Current screen: {screen}
-
-Was the task completed? Reply ONLY with valid JSON:
-{{
-  "success": true,
-  "observation": "What I see on screen",
-  "should_retry": false,
-  "retry_actions": []
-}}"""
-    try:
-        raw = _call(llm, prompt).strip()
-        raw = re.sub(r"^```(?:json)?\s*", "", raw)
-        raw = re.sub(r"\s*```$", "", raw)
-        return json.loads(raw)
-    except Exception as e:
-        return {"success": False, "observation": str(e), "should_retry": False, "retry_actions": []}
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# FastAPI app
-# ─────────────────────────────────────────────────────────────────────────────
-
-app = FastAPI(title="Pecifics AI Backend", version="3.0.0")
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+# ─── LLM ─────────────────────────────────────────────────────────────────────
 
 _llm = None
+
+def create_llm():
+    if not HAS_GROQ or not GROQ_API_KEY:
+        raise ValueError("GROQ_API_KEY not set. Free key: https://console.groq.com")
+    return ChatGroq(api_key=GROQ_API_KEY, model_name=GROQ_MODEL, temperature=0.1)
 
 def get_llm():
     global _llm
@@ -708,256 +277,433 @@ def get_llm():
         _llm = create_llm()
     return _llm
 
+def _call(llm, prompt: str) -> str:
+    try:
+        resp = llm.invoke([HumanMessage(content=prompt)])
+        text = resp.content if hasattr(resp, "content") else str(resp)
+        logger.debug(f"LLM raw ({len(text)} chars): {text[:300]}")
+        return text
+    except TypeError:
+        return llm.invoke(prompt)
+    except Exception as e:
+        logger.error(f"LLM call failed: {e}")
+        raise
+
+# ─── VISION PROVIDER ─────────────────────────────────────────────────────────
+
+async def call_vision_provider(screenshot_b64: str, goal: str, step_history: list,
+                                w: int, h: int, cogagent_url: str = None) -> dict:
+    """Call CogAgent (Kaggle) or Gemini for vision actions."""
+    
+    # Priority 1: CogAgent on Kaggle (prefer dynamic URL from frontend)
+    effective_url = cogagent_url or COGAGENT_URL
+    if effective_url:
+        try:
+            async with httpx.AsyncClient(timeout=120.0) as client:
+                resp = await client.post(f"{effective_url.rstrip('/')}/vision_act", json={
+                    "screenshot": screenshot_b64, "goal": goal,
+                    "step_history": step_history,
+                    "screen_width": w, "screen_height": h,
+                })
+                if resp.status_code == 200:
+                    result = resp.json()
+                    result.setdefault("action", "fail")
+                    result.setdefault("description", "")
+                    logger.info(f"CogAgent → {result.get('action')}: {result.get('description','')[:80]}")
+                    return result
+                logger.warning(f"CogAgent {resp.status_code}, falling back")
+        except Exception as e:
+            logger.warning(f"CogAgent error: {e}, falling back")
+    
+    # Priority 2: Gemini
+    if HAS_GEMINI and GEMINI_API_KEY:
+        return await _gemini_vision_act(screenshot_b64, goal, step_history, w, h)
+    
+    return {"action": "fail", "description": "No vision provider. Set COGAGENT_URL or GEMINI_API_KEY."}
+
+
+VISION_ACT_PROMPT = """You are a SCREEN AGENT controlling a computer by looking at screenshots.
+Decide the ONE next action to progress the user's goal.
+
+TASK: {goal}
+
+STEPS DONE:
+{history}
+
+SCREENSHOT: {w}×{h} pixels. (0,0)=top-left.
+
+RULES:
+1. Return EXACTLY ONE action as JSON.
+2. Aim for CENTER of UI elements.
+3. Dismiss popups/banners FIRST.
+4. Click field first, then type next step.
+5. Goal achieved → {{"action":"done"}}.
+6. Cannot proceed → {{"action":"fail","description":"reason"}}.
+
+ACTIONS:
+  {{"action":"click","x":<int>,"y":<int>,"description":"what"}}
+  {{"action":"double_click","x":<int>,"y":<int>,"description":"what"}}
+  {{"action":"right_click","x":<int>,"y":<int>,"description":"what"}}
+  {{"action":"type","text":"...","description":"typing"}}
+  {{"action":"type","x":<int>,"y":<int>,"text":"...","description":"click+type"}}
+  {{"action":"key","key":"Enter","description":"pressing Enter"}}
+  {{"action":"scroll","direction":"down","clicks":3,"description":"scrolling"}}
+  {{"action":"wait","duration":2000,"description":"waiting"}}
+  {{"action":"done","description":"complete"}}
+  {{"action":"fail","description":"cannot proceed"}}
+
+Return ONLY the JSON object."""
+
+
+async def _gemini_vision_act(b64, goal, history, w, h):
+    history_str = "\n".join(
+        f"  {i+1}. [{s.get('action','?')}] {s.get('description','')}{' ✓' if s.get('success') else ' ✗'}"
+        for i, s in enumerate(history)
+    ) or "(none)"
+
+    prompt = VISION_ACT_PROMPT.format(goal=goal, history=history_str, w=w, h=h)
+    try:
+        genai.configure(api_key=GEMINI_API_KEY)
+        model = genai.GenerativeModel(GEMINI_MODEL)
+        img_data = base64.b64decode(b64)
+        resp = model.generate_content(
+            [prompt, {"mime_type": "image/jpeg", "data": img_data}],
+            generation_config={"temperature": 0.1, "max_output_tokens": 512}
+        )
+        raw = resp.text.strip()
+        raw = re.sub(r"^```(?:json)?\s*", "", raw)
+        raw = re.sub(r"\s*```$", "", raw)
+        result = json.loads(raw)
+        result.setdefault("action", "fail")
+        result.setdefault("description", "")
+        return result
+    except json.JSONDecodeError:
+        m = re.search(r'\{[^}]+\}', raw)
+        if m:
+            try: return json.loads(m.group())
+            except: pass
+        return {"action": "fail", "description": f"Vision JSON error: {raw[:100]}"}
+    except Exception as e:
+        err_str = str(e)
+        if "429" in err_str or "quota" in err_str.lower():
+            logger.error("Gemini API quota exceeded — set COGAGENT_URL to use CogAgent instead")
+            return {"action": "fail", "description": "Gemini quota exceeded. Please set your CogAgent URL in Settings (from Kaggle notebook ngrok URL)."}
+        return {"action": "fail", "description": f"Vision error: {err_str[:200]}"}
+
+
+def describe_screenshot(b64: str) -> str:
+    if not b64: return "No screenshot."
+    if HAS_GEMINI and GEMINI_API_KEY:
+        try:
+            genai.configure(api_key=GEMINI_API_KEY)
+            model = genai.GenerativeModel(GEMINI_MODEL)
+            resp = model.generate_content([
+                "Describe this Windows screenshot in ≤80 words.",
+                {"mime_type": "image/jpeg", "data": base64.b64decode(b64)},
+            ])
+            return resp.text.strip()
+        except: pass
+    return "Screenshot captured."
+
+# ─── TASK PLANNER ─────────────────────────────────────────────────────────────
+
+def plan_tasks(user_message, screenshot_b64, conversation_history,
+               screen_width, screen_height, user_choice, extra_context="",
+               retry_count=0, previous_error=None):
+    llm = get_llm()
+    
+    history_txt = "\n".join(
+        f"{'User' if t.get('role')=='user' else 'AI'}: {t.get('content','')}"
+        for t in conversation_history[-6:]
+    )
+    screen_desc = describe_screenshot(screenshot_b64) if screenshot_b64 else "No screenshot."
+    retry_ctx = f"\n\nPREVIOUS FAILED: {previous_error}\nUse DIFFERENT approach." if retry_count > 0 and previous_error else ""
+    
+    if user_choice:
+        user_message += f"\n[User selected: {user_choice.get('type')}={user_choice.get('value')}]"
+
+    prompt = f"""{SYSTEM_PROMPT}
+{extra_context}
+SCREEN: {screen_desc}
+SCREEN SIZE: {screen_width}x{screen_height}
+HISTORY:
+{history_txt}
+{retry_ctx}
+
+USER: {user_message}
+
+Return ONLY valid JSON."""
+
+    try:
+        raw = _call(llm, prompt).strip()
+        logger.info(f"LLM response ({len(raw)} chars): {raw[:500]}")
+        raw = re.sub(r"^```(?:json)?\s*", "", raw)
+        raw = re.sub(r"\s*```$", "", raw)
+        
+        # Try direct parse first
+        try:
+            result = json.loads(raw)
+        except json.JSONDecodeError:
+            # Extract the outermost JSON object from mixed text
+            depth = 0; start = -1; result = None
+            for i, c in enumerate(raw):
+                if c == '{':
+                    if depth == 0: start = i
+                    depth += 1
+                elif c == '}':
+                    depth -= 1
+                    if depth == 0 and start >= 0:
+                        try:
+                            result = json.loads(raw[start:i+1])
+                            break
+                        except json.JSONDecodeError:
+                            start = -1
+            if result is None:
+                raise json.JSONDecodeError("No valid JSON object found", raw, 0)
+        
+        result.setdefault("message", "Processing…")
+        result.setdefault("expected_result", "")
+        
+        # Normalize: support old format (actions) → new format (tasks)
+        if "tasks" not in result and "actions" in result:
+            actions = result.pop("actions", [])
+            needs_input = result.get("clarification_needed", False)
+            input_fields = result.get("clarification_fields", [])
+            result["tasks"] = [{
+                "id": 1,
+                "description": result.get("task_summary", result["message"]),
+                "needs_input": needs_input,
+                "input_fields": input_fields,
+                "actions": actions if not needs_input else [],
+            }]
+        
+        result.setdefault("tasks", [])
+        for i, task in enumerate(result["tasks"]):
+            task.setdefault("id", i + 1)
+            task.setdefault("description", "")
+            task.setdefault("needs_input", False)
+            task.setdefault("input_fields", [])
+            task.setdefault("actions", [])
+        
+        return result
+    
+    except json.JSONDecodeError as e:
+        logger.error(f"Plan JSON error (attempt {retry_count+1}): {e}\nRaw: {raw[:500] if 'raw' in dir() else 'N/A'}")
+        if retry_count < MAX_RETRIES:
+            return plan_tasks(user_message, screenshot_b64, conversation_history,
+                             screen_width, screen_height, user_choice, extra_context,
+                             retry_count+1, f"JSON error: {e}. Return ONLY valid JSON, no markdown, no extra text.")
+        return {"message": "Planning failed. Please rephrase.", "tasks": []}
+    except Exception as e:
+        logger.error(f"Plan error (attempt {retry_count+1}): {e}")
+        if retry_count < MAX_RETRIES:
+            return plan_tasks(user_message, screenshot_b64, conversation_history,
+                             screen_width, screen_height, user_choice, extra_context,
+                             retry_count+1, str(e))
+        return {"message": f"Error: {e}", "tasks": []}
+
+
+def verify_completion(screenshot_b64, task, expected):
+    llm = get_llm()
+    screen = describe_screenshot(screenshot_b64) if screenshot_b64 else "No screenshot."
+    prompt = f"""Task: "{task}"
+Expected: "{expected}"
+Screen: {screen}
+
+Was it completed? Return ONLY JSON:
+{{"success": true, "observation": "what I see", "should_retry": false, "retry_actions": []}}"""
+    try:
+        raw = _call(llm, prompt).strip()
+        raw = re.sub(r"^```(?:json)?\s*", "", raw)
+        raw = re.sub(r"\s*```$", "", raw)
+        return json.loads(raw)
+    except:
+        return {"success": False, "observation": "Verification failed", "should_retry": False}
+
+
+# ─── PPT HELPER ──────────────────────────────────────────────────────────────
+
+def _resolve_save_dir(friendly):
+    import pathlib
+    home = str(pathlib.Path.home())
+    low = friendly.strip().lower()
+    if low == "desktop":    return os.path.join(home, "Desktop")
+    if low == "documents":  return os.path.join(home, "Documents")
+    if low == "downloads":  return os.path.join(home, "Downloads")
+    if os.path.isabs(friendly): return friendly
+    return os.path.join(home, "Desktop")
+
+# ─── FASTAPI ─────────────────────────────────────────────────────────────────
+
+app = FastAPI(title="Pecifics AI Backend", version="4.0.0")
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 @app.get("/health")
 async def health():
     status = "ok"
-    try:
-        get_llm()
-    except Exception as e:
-        status = f"error: {e}"
-    model = {
-        "ollama": OLLAMA_MODEL, "groq": GROQ_MODEL,
-        "huggingface": HF_MODEL, "transformers": HF_LOCAL_MODEL, "openai": OPENAI_MODEL,
-    }.get(LLM_PROVIDER, "?")
-    return {"status": "ok", "version": "3.0.0",
-            "llm_provider": LLM_PROVIDER, "llm_model": model,
-            "llm_status": status, "timestamp": datetime.now().isoformat()}
-
+    try: get_llm()
+    except Exception as e: status = f"error: {e}"
+    vision = "cogagent" if COGAGENT_URL else ("gemini" if GEMINI_API_KEY else "none")
+    return {"status": "ok", "version": "4.0.0", "llm": f"groq/{GROQ_MODEL}",
+            "vision": vision, "cogagent_url": COGAGENT_URL or "not set",
+            "timestamp": datetime.now().isoformat()}
 
 @app.post("/chat")
 async def chat(req: ChatRequest):
+    try: get_llm()
+    except Exception as e: raise HTTPException(503, f"LLM unavailable: {e}")
     try:
-        llm = get_llm()
-    except Exception as e:
-        raise HTTPException(status_code=503, detail=f"LLM unavailable: {e}")
-
-    try:
-        result = plan_actions(
-            user_message=req.message,
-            screenshot_b64=req.screenshot,
-            conversation_history=req.conversation_history or [],
-            screen_width=req.screen_width or 1920,
-            screen_height=req.screen_height or 1080,
-            user_choice=req.user_choice,
-            llm=llm,
-        )
-        if req.session_id:
-            sessions[req.session_id] = {
-                "task": req.message,
-                "expected": result.get("expected_result", ""),
-                "history": req.conversation_history or [],
-                "retry_count": 0,
-            }
+        extra = ""
+        if req.user_home:
+            extra = f"\nFRONTEND_USER_HOME: {req.user_home.replace(chr(92), chr(92)*2)}"
+        result = plan_tasks(req.message, req.screenshot, req.conversation_history or [],
+                           req.screen_width or 1920, req.screen_height or 1080,
+                           req.user_choice, extra)
         return JSONResponse(content=result)
     except Exception as e:
         logger.error(traceback.format_exc())
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(500, str(e))
 
+@app.post("/vision_act")
+async def vision_act(req: VisionActRequest):
+    # Update global COGAGENT_URL if frontend sent one (persists for session)
+    global COGAGENT_URL
+    if req.cogagent_url and req.cogagent_url.strip():
+        COGAGENT_URL = req.cogagent_url.strip()
+        logger.info(f"CogAgent URL updated from request: {COGAGENT_URL}")
+    return await call_vision_provider(req.screenshot, req.goal, req.step_history,
+                                      req.screen_width or 1920, req.screen_height or 1080,
+                                      cogagent_url=req.cogagent_url)
 
-@app.post("/continue")
-async def continue_task(req: ContinueRequest):
-    try: llm = get_llm()
-    except Exception as e: raise HTTPException(status_code=503, detail=str(e))
-
-    session = sessions.get(req.session_id)
-    if not session:
-        raise HTTPException(status_code=404, detail="Session not found")
-
-    results_summary = "\n".join(
-        f"- {r.get('action','?')}: {'✅' if r.get('result',{}).get('success') else '❌ '+str(r.get('result',{}).get('error',''))}"
-        for r in req.action_results
-    )
-    failed = [r for r in req.action_results if not r.get("result", {}).get("success")]
-
-    if not failed:
-        vr = verify_completion(req.screenshot or "", session["task"], session["expected"], llm)
-        if vr.get("should_retry") and session["retry_count"] < MAX_RETRIES:
-            session["retry_count"] += 1
-            return {"done": False, "message": f"🔄 Retrying… {vr.get('observation','')}",
-                    "actions": vr.get("retry_actions", [])}
-        sessions.pop(req.session_id, None)
-        done_msg = "✅ Task completed!" if vr.get("success") else f"⚠️ {vr.get('observation','')}"
-        return {"done": True, "message": done_msg, "observation": vr.get("observation", "")}
-
-    if session["retry_count"] >= MAX_RETRIES:
-        sessions.pop(req.session_id, None)
-        return {"done": True, "message": f"❌ Failed after {MAX_RETRIES} retries.\n{results_summary}"}
-
-    session["retry_count"] += 1
-    failed_desc = "; ".join(f"{r.get('action')}: {r.get('result',{}).get('error','?')}" for r in failed)
-    replan = plan_actions(
-        user_message=f"ORIGINAL TASK: {session['task']}\nDONE:\n{results_summary}\nFAILURES: {failed_desc}\nPlan ONLY remaining/retry steps using a DIFFERENT approach for what failed.",
-        screenshot_b64=req.screenshot,
-        conversation_history=session.get("history", []),
-        screen_width=1920, screen_height=1080, user_choice=None, llm=llm,
-        retry_count=session["retry_count"], previous_error=failed_desc,
-    )
-    return {"done": False, "message": replan.get("message", "Retrying…"),
-            "actions": replan.get("actions", [])}
-
+@app.post("/set_config")
+async def set_config(req: dict):
+    """Update runtime config from frontend settings panel."""
+    global COGAGENT_URL, GEMINI_API_KEY
+    updated = []
+    if req.get("cogagent_url"):
+        COGAGENT_URL = req["cogagent_url"].strip()
+        updated.append(f"COGAGENT_URL={COGAGENT_URL}")
+    if req.get("gemini_api_key"):
+        GEMINI_API_KEY = req["gemini_api_key"].strip()
+        updated.append("GEMINI_API_KEY=***")
+    logger.info(f"Config updated: {updated}")
+    return {"success": True, "updated": updated}
 
 @app.post("/verify")
 async def verify(req: VerifyRequest):
-    try:
-        return JSONResponse(content=verify_completion(req.screenshot, req.task, req.expected_result, get_llm()))
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
+    return JSONResponse(content=verify_completion(req.screenshot, req.task, req.expected_result))
 
 @app.post("/analyze_screen")
 async def analyze_screen(req: AnalyzeScreenRequest):
-    try:
-        llm = get_llm()
-        screenshot = req.screenshot or ""
-        question   = req.question or "What do you see?"
-        desc = describe_screenshot(screenshot, llm)
-        # For OpenAI, use full vision Q&A
-        if LLM_PROVIDER == "openai" and HAS_OPENAI and OPENAI_API_KEY and screenshot:
-            try:
-                vis = ChatOpenAI(model="gpt-4o", api_key=OPENAI_API_KEY, temperature=0, max_tokens=600)
-                resp = vis.invoke([HumanMessage(content=[
-                    {"type": "text", "text": question},
-                    {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{screenshot}", "detail": "high"}},
-                ])])
-                return {"answer": resp.content, "description": desc}
-            except Exception:
-                pass
-        return {"answer": f"Screen: {desc}\n\nQuestion: {question}", "description": desc}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-class BrowserStateRequest(BaseModel):
-    screenshot: str = ""
-
+    desc = describe_screenshot(req.screenshot or "")
+    return {"answer": desc, "description": desc}
 
 @app.post("/check_browser_state")
 async def check_browser_state(req: BrowserStateRequest):
-    """Analyze a browser page screenshot and detect any blocking states."""
-    screenshot = req.screenshot or ""
-    if not screenshot:
-        return {"state": "clear", "description": "No screenshot", "can_auto_handle": False,
-                "auto_selector": None, "needs_user": False, "user_message": None}
+    if not req.screenshot or not (HAS_GEMINI and GEMINI_API_KEY):
+        return {"state": "clear", "can_auto_handle": False, "needs_user": False}
     try:
-        prompt = """You are analyzing a browser screenshot to detect blocking states.
+        genai.configure(api_key=GEMINI_API_KEY)
+        model = genai.GenerativeModel(GEMINI_MODEL)
+        resp = model.generate_content([
+            'Analyze browser screenshot for blockers. Return JSON: {"state":"clear|cookie_consent|2fa|captcha|error","description":"...","can_auto_handle":true/false,"needs_user":true/false,"user_message":"..."}',
+            {"mime_type": "image/jpeg", "data": base64.b64decode(req.screenshot)}
+        ])
+        raw = resp.text.strip()
+        if raw.startswith("```"):
+            raw = raw.split("```")[1]
+            if raw.startswith("json"): raw = raw[4:]
+        return json.loads(raw.strip())
+    except:
+        return {"state": "clear", "can_auto_handle": False, "needs_user": False}
 
-Identify the state and return ONLY valid JSON (no markdown, no extra text):
+@app.post("/next_step")
+async def next_step(req: NextStepRequest):
+    try: llm = get_llm()
+    except: return {"decision": "continue", "next_actions": []}
+    
+    screen = describe_screenshot(req.screenshot) if req.screenshot else "No screenshot."
+    prompt = f"""TASK: {req.original_task}
+LAST: {json.dumps(req.last_action)} → {json.dumps(req.last_result)}
+SCREEN: {screen}
+REMAINING: {json.dumps(req.remaining_actions[:3])}
 
-States:
-- clear          : Page loaded fine, no blockers
-- cookie_consent : Cookie / privacy banner with Accept/Allow/OK button visible
-- confirm_button : A Continue / Next / Got it / Dismiss / OK popup blocking the page
-- verify_email   : Page says \"check your email\", \"verify your email\", \"confirmation sent\"
-- 2fa            : 2-factor auth / OTP / authenticator code entry required
-- captcha        : reCAPTCHA or image captcha is shown
-- error          : Login failed / wrong password / account issue / blocking error
-- loading        : Page is still loading or mid-redirect
+Decide: continue|replace|done. Return JSON: {{"decision":"...","message":"...","next_actions":[]}}"""
+    try:
+        raw = _call(llm, prompt).strip()
+        raw = re.sub(r"^```(?:json)?\s*", "", raw)
+        raw = re.sub(r"\s*```$", "", raw)
+        result = json.loads(raw)
+        result.setdefault("decision", "continue")
+        result.setdefault("next_actions", [])
+        return result
+    except:
+        return {"decision": "continue", "next_actions": []}
 
-Return exactly:
-{\n  \"state\": \"<one of the above>\",\n  \"description\": \"One sentence of what you see\",\n  \"can_auto_handle\": true or false,\n  \"auto_selector\": \"CSS selector to click or null\",\n  \"needs_user\": true or false,\n  \"user_message\": \"Message to show user or null\"\n}
-
-Rules:
-- cookie_consent / confirm_button: can_auto_handle=true, provide the most specific CSS selector for the button
-- verify_email: needs_user=true, user_message=\"Check your email inbox and click the verification link, then come back.\"
-- 2fa: needs_user=true, user_message=\"Please enter the 2FA/OTP code shown in your authenticator app or SMS.\"
-- captcha: needs_user=true, user_message=\"A CAPTCHA is shown. Please solve it manually in the browser.\"
-- error: needs_user=true, describe the error in user_message
-- clear / loading: can_auto_handle=false, needs_user=false"""
-
-        if HAS_GEMINI and GEMINI_API_KEY:
-            import google.generativeai as genai
-            genai.configure(api_key=GEMINI_API_KEY)
-            model = genai.GenerativeModel(GEMINI_MODEL)
-            img_data = base64.b64decode(screenshot)
-            img_part = {"mime_type": "image/jpeg", "data": img_data}
-            resp = model.generate_content([prompt, img_part])
-            raw = resp.text.strip()
-            # Strip markdown code fences if present
-            if raw.startswith("```"):
-                raw = raw.split("```")[1]
-                if raw.startswith("json"): raw = raw[4:]
-            import json as _json
-            return _json.loads(raw.strip())
-        # Fallback: return clear if no vision
-        return {"state": "clear", "description": "Vision not available",
-                "can_auto_handle": False, "auto_selector": None,
-                "needs_user": False, "user_message": None}
+@app.post("/generate_ppt")
+async def generate_ppt_endpoint(req: GeneratePPTRequest):
+    try: llm = get_llm()
+    except Exception as e: raise HTTPException(503, str(e))
+    
+    title = req.title or req.topic.title()
+    content_prompt = f"""Generate {req.num_slides} slides about: {req.topic}
+Title: {title}
+{"Instructions: " + req.additional_instructions if req.additional_instructions else ""}
+Return JSON array: hero, two_column, big_number, comparison, quote types.
+First=hero, last=quote. Be specific."""
+    
+    try:
+        raw = _call(llm, content_prompt).strip()
+        raw = re.sub(r"^```(?:json)?\s*", "", raw)
+        raw = re.sub(r"\s*```$", "", raw)
+        slides_data = json.loads(raw)
+        if not isinstance(slides_data, list): slides_data = [slides_data]
+    except:
+        slides_data = [
+            {"type": "hero", "title": title, "subtitle": "Presentation"},
+            {"type": "quote", "quote": "The future belongs to those who prepare.", "author": "Malcolm X"}
+        ]
+    
+    try:
+        from ppt_generator_pro import (PREMIUM_THEMES, create_hero_slide, create_two_column_slide,
+            create_big_number_slide, create_comparison_slide, create_quote_slide, add_slide_transition_advanced)
+        from pptx import Presentation as PptxPresentation
+        from pptx.util import Inches
+        
+        prs = PptxPresentation()
+        prs.slide_width = Inches(10); prs.slide_height = Inches(7.5)
+        colors = PREMIUM_THEMES.get(req.theme.lower().replace(" ","_"), PREMIUM_THEMES.get("gamma_modern"))
+        
+        for idx, sd in enumerate(slides_data):
+            t = sd.get("type", "two_column")
+            try:
+                if t == "hero": s = create_hero_slide(prs, sd.get("title",title), sd.get("subtitle",""), colors)
+                elif t == "big_number": s = create_big_number_slide(prs, sd.get("title",""), sd.get("number",""), sd.get("description",""), colors)
+                elif t == "comparison": s = create_comparison_slide(prs, sd.get("title",""), sd.get("left_title","A"), sd.get("left_items",[]), sd.get("right_title","B"), sd.get("right_items",[]), colors)
+                elif t == "quote": s = create_quote_slide(prs, sd.get("quote",""), sd.get("author",""), colors)
+                else: s = create_two_column_slide(prs, sd.get("title",""), sd.get("left_content",[]), sd.get("right_content",[]), colors)
+                add_slide_transition_advanced(s, ["zoom","reveal","morph","fade"][idx%4])
+            except Exception as se: logger.warning(f"Slide {idx}: {se}")
+        
+        save_dir = _resolve_save_dir(req.save_path)
+        os.makedirs(save_dir, exist_ok=True)
+        filename = re.sub(r'[\\/:*?"<>|]', '_', title) + ".pptx"
+        full_path = os.path.join(save_dir, filename)
+        prs.save(full_path)
+        return {"success": True, "path": full_path.replace("\\","/"), "slides_count": len(slides_data),
+                "message": f"Created '{title}' ({len(slides_data)} slides) at {full_path}"}
+    except ImportError as ie: raise HTTPException(500, f"ppt_generator_pro missing: {ie}")
     except Exception as e:
-        logger.warning(f"check_browser_state error: {e}")
-        return {"state": "clear", "description": f"Check failed: {str(e)}",
-                "can_auto_handle": False, "auto_selector": None,
-                "needs_user": False, "user_message": None}
+        logger.error(traceback.format_exc())
+        raise HTTPException(500, str(e))
 
-
-@app.get("/capabilities")
-async def capabilities():
-    providers = {
-        "ollama":       {"cost": "FREE (local)", "needs_key": False, "model": OLLAMA_MODEL,
-                         "setup": "ollama pull llama3"},
-        "groq":         {"cost": "FREE tier",    "needs_key": True,  "model": GROQ_MODEL,
-                         "key_url": "https://console.groq.com"},
-        "huggingface":  {"cost": "FREE tier",    "needs_key": True,  "model": HF_MODEL,
-                         "key_url": "https://huggingface.co/settings/tokens"},
-        "transformers": {"cost": "FREE (GPU)",   "needs_key": False, "model": HF_LOCAL_MODEL,
-                         "setup": "uses local GPU"},
-        "openai":       {"cost": "PAID",         "needs_key": True,  "model": OPENAI_MODEL,
-                         "key_url": "https://platform.openai.com/api-keys"},
-    }
-    return {
-        "version": "3.0.0",
-        "active_provider": LLM_PROVIDER,
-        "active_model": providers.get(LLM_PROVIDER, {}).get("model", "?"),
-        "all_providers": providers,
-        "features": [
-            "Natural language → action planning",
-            "Multi-turn retry with automatic fallback approaches",
-            "Vision screen analysis (Ollama llava / GPT-4o / Qwen2-VL)",
-            "Task completion verification",
-            "50+ Windows OS operations",
-            "Playwright browser automation",
-            "MS Office COM automation (Word, Excel, PowerPoint)",
-            "Full file system control",
-            "System management: volume, WiFi, Bluetooth, power, registry…",
-        ],
-    }
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# CLI entrypoint
-# ─────────────────────────────────────────────────────────────────────────────
-
+# ─── STARTUP ─────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     import argparse
-    parser = argparse.ArgumentParser(description="Pecifics AI Backend")
-    parser.add_argument("--host",     default="0.0.0.0")
-    parser.add_argument("--port",     type=int, default=8000)
-    parser.add_argument("--ngrok",    action="store_true", help="Expose via ngrok tunnel")
-    parser.add_argument("--provider", default=None,
-                        help="Override LLM_PROVIDER (ollama|groq|huggingface|transformers|openai)")
-    args = parser.parse_args()
-
-    if args.provider:
-        os.environ["LLM_PROVIDER"] = args.provider
-        LLM_PROVIDER = args.provider  # update module-level var
-
-    if args.ngrok:
-        try:
-            from pyngrok import ngrok
-            token = os.getenv("NGROK_TOKEN", "")
-            if token: ngrok.set_auth_token(token)
-            tunnel = ngrok.connect(args.port)
-            url = tunnel.public_url
-            logger.info("┌───────────────────────────────────────────────────┐")
-            logger.info(f"│  Pecifics Backend  ►  {url:<30}│")
-            logger.info("│  Paste this URL into Pecifics Settings            │")
-            logger.info("└───────────────────────────────────────────────────┘")
-        except Exception as e:
-            logger.warning(f"ngrok failed: {e}")
-
-    model_label = {
-        "ollama": OLLAMA_MODEL, "groq": GROQ_MODEL, "huggingface": HF_MODEL,
-        "transformers": HF_LOCAL_MODEL, "openai": OPENAI_MODEL,
-    }.get(LLM_PROVIDER, "?")
-    logger.info(f"Provider: {LLM_PROVIDER}  |  Model: {model_label}")
-    uvicorn.run(app, host=args.host, port=args.port, log_level="info")
+    p = argparse.ArgumentParser()
+    p.add_argument("--port", type=int, default=8000)
+    p.add_argument("--host", default="0.0.0.0")
+    args = p.parse_args()
+    logger.info(f"Planner: Groq/{GROQ_MODEL}")
+    logger.info(f"Vision : {'CogAgent@'+COGAGENT_URL if COGAGENT_URL else 'Gemini/'+GEMINI_MODEL if GEMINI_API_KEY else 'NONE'}")
+    uvicorn.run(app, host=args.host, port=args.port)
